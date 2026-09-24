@@ -1,158 +1,45 @@
-//! File browser provider — Rust port of `lib_filebrowser/`.
+//! The file browser: the filesystem as a list of lists.
 //!
-//! Implements the [`Provider`] trait using `std::fs` for all filesystem
-//! operations.  Mirrors the C provider's behaviour exactly:
+//! A sicompass WASM plugin. It asks for the whole disk (`"filesystem": ["/"]`
+//! in `plugin.json`, shown at install), so the sandbox preopens `/` at its real
+//! path and `std::fs` works as it always did:
 //!
-//! - Root is `/` (or the drive-list sentinel on Windows).
-//! - Each directory entry is wrapped in `<input>name</input>` tags so the
-//!   user can rename items inline.
-//! - Directories are `FfonElement::Obj`; files are `FfonElement::Str`.
-//! - A `meta` object (index 0) lists the available keyboard shortcuts.
-//! - Supports commands: create directory, create file, show/hide properties,
-//!   sort alphanumerically, sort chronologically, open file with.
-//! - `commit_edit(old, new)` performs a rename.
-//! - `delete_item` / `create_directory` / `create_file` / `copy_item` use
-//!   `std::fs` primitives or recursive helpers.
-//! - `extended_search` is a BFS traversal (up to 50 000 results).
+//! - Root is `/`.
+//! - Each directory entry is wrapped in `<input>name</input>` so the user can
+//!   rename it inline. Directories are `Obj`, files are `Str`.
+//! - Commands: create directory, create file, show/hide properties, show/hide
+//!   hidden files, sort alphanumerically or chronologically.
+//! - `commit_edit(old, new)` renames, `delete_item` moves to the OS trash
+//!   through the host (`desktop.trash`), `copy_item` copies recursively.
+//! - Extended search is a BFS walk (up to 50 000 results).
+//!
+//! A delete is undoable: the item is snapshotted first
+//! (`sicompass_sdk::fs_snapshot`) and the snapshot rides in the `ProviderOp`
+//! the app keeps on its timeline, so an undo writes it back even after the
+//! trash was emptied. Too large to snapshot, it asks `desktop.restore`.
+//!
+//! What the sandbox does not have: Unix permission bits and owner names (the
+//! properties view shows size and date there), and the list of the system's
+//! applications, so there is no "open file with" (the app opens a file with
+//! its default program itself).
 
+mod desktop;
+pub mod localize;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use desktop::{Desktop, HostDesktop};
+use sicompass_pdk::{Descriptor, Plugin, ProviderOp, SearchResult, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
-use sicompass_sdk::localize;
+use sicompass_sdk::fs_snapshot;
 use sicompass_sdk::placeholders::new_obj_with_i_placeholder;
-use sicompass_sdk::provider::{ListItem, Provider, SearchResultItem};
 use sicompass_sdk::tags;
-use sicompass_sdk::timeline::{FsOpKind, FsSideEffect, TimelineEntry};
-use std::sync::OnceLock;
-
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent — safe to call from many entry points.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
+use sicompass_sdk::timeline::FsSideEffect;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-// ---------------------------------------------------------------------------
-// Test stub: never move anything to the real OS trash from a test.
-//
-// `delete_item` and `redo` hand the target to the `trash` crate, which on Linux
-// moves it into `$XDG_DATA_HOME/Trash` — the developer's own trash, which keeps
-// every fixture forever. The delete tests here trash `aaa`, `doomed.txt`,
-// `undotest.txt` and friends dozens of times per run, and about a thousand runs
-// left 37 850 test fixtures in a 45 479-entry trash. That is what made the real
-// one unusable.
-//
-// The stub cannot be a no-op the way the history and notes stubs are: a dozen
-// tests assert the file is *gone* after a delete, and weakening them is not an
-// option. So under the flag the item is removed permanently instead of trashed.
-// Everything a test can observe stays true — the path is gone, and a path that
-// was never there is still an error, so `delete_item` keeps returning `false`
-// for it. In-app undo is unaffected either way, because it replays the
-// `fs_trash::snapshot_for_delete` snapshot taken before the delete, not the
-// trash. The one thing that is lost is `fs_trash::restore_from_os_trash`, the
-// fallback for items too large to snapshot; the single test that exercises it
-// takes `trash_flag_guard(false)` and says so.
-//
-// Two audiences, hence both a compile-time default and a runtime setter:
-//
-// * This crate's own unit tests get it from `cfg!(test)`. There is no
-//   per-instance override to forget, which is the point: the sink is a free
-//   function, so nothing a test constructs can opt into safety.
-// * The app's integration tests are a different binary, where this crate is an
-//   ordinary dependency compiled *without* `cfg(test)`, and they reach the
-//   provider as a `Box<dyn Provider>` with no way to set anything. They call
-//   `_set_test_no_trash(true)` once per binary instead.
-// ---------------------------------------------------------------------------
-
-static TEST_NO_TRASH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(cfg!(test));
-
-#[doc(hidden)]
-pub fn _set_test_no_trash(enabled: bool) {
-    TEST_NO_TRASH.store(enabled, std::sync::atomic::Ordering::Release);
-}
-
-// Per-test opt-out from the stub, for the one test that genuinely needs the
-// real trash. Thread-local on purpose: the test harness gives every test its
-// own thread, so this is scoped to exactly one test. A process-global
-// off-switch is *not* — it was tried, and while the oversized-restore test
-// held it off, every delete test running concurrently in another thread saw
-// the off value and put its fixture in the developer's real trash.
-#[cfg(test)]
-thread_local! {
-    static ALLOW_REAL_TRASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[inline]
-fn test_no_trash() -> bool {
-    #[cfg(test)]
-    if ALLOW_REAL_TRASH.with(|a| a.get()) {
-        return false;
-    }
-    TEST_NO_TRASH.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Move `path` to the OS trash, or remove it permanently when the test stub is
-/// on. Every delete in this crate goes through here; `os_trash_delete` is the
-/// only place allowed to name the `trash` crate, which
-/// `sicompass/tests/hygiene.rs` enforces.
-fn trash_delete(path: &Path) -> Result<(), trash::Error> {
-    if test_no_trash() {
-        return permanent_delete(path);
-    }
-    os_trash_delete(path)
-}
-
-/// The stubbed delete. Mirrors what a caller can observe from a successful
-/// trash: the path is gone afterwards, and a path that was not there to begin
-/// with is an error rather than a silent success.
-fn permanent_delete(path: &Path) -> Result<(), trash::Error> {
-    let unknown = |e: std::io::Error| trash::Error::Unknown {
-        description: format!("test stub: {} ({e})", path.display()),
-    };
-    // `symlink_metadata`, not `metadata`: a symlink to a directory must be
-    // unlinked, not recursed into.
-    let meta = std::fs::symlink_metadata(path).map_err(unknown)?;
-    if meta.is_dir() {
-        std::fs::remove_dir_all(path).map_err(unknown)
-    } else {
-        std::fs::remove_file(path).map_err(unknown)
-    }
-}
-
-/// Move `path` to the OS trash.
-///
-/// On macOS the `trash` crate defaults to `DeleteMethod::Finder`, which spawns
-/// `osascript` and drives Finder over an Apple event for every single delete.
-/// That needs Finder to be running and responsive, asks the user for an
-/// automation permission, plays the trash sound, and serializes badly:
-/// concurrent deletes contend on the same Apple event queue and start failing,
-/// which surfaces here as `delete_item` returning `false` for no visible
-/// reason. `NsFileManager` calls `trashItemAtURL` directly instead — faster,
-/// silent, no extra permission, no running Finder required.
-///
-/// The tradeoff is that some macOS versions do not record the "Put Back"
-/// entry, so restoring from the Finder side may mean dragging the item out of
-/// the Trash. In-app undo is unaffected: it restores from the snapshot
-/// [`sicompass_sdk::fs_trash::snapshot_for_delete`] took before the delete.
-#[cfg(target_os = "macos")]
-fn os_trash_delete(path: &Path) -> Result<(), trash::Error> {
-    use trash::macos::{DeleteMethod, TrashContextExtMacos};
-    let mut ctx = trash::TrashContext::default();
-    ctx.set_delete_method(DeleteMethod::NsFileManager);
-    ctx.delete(path)
-}
-
-/// See the macOS variant above; everywhere else the crate default is fine.
-#[cfg(not(target_os = "macos"))]
-fn os_trash_delete(path: &Path) -> Result<(), trash::Error> {
-    trash::delete(path)
-}
+/// The `ProviderOp` command of an undoable delete.
+const OP_DELETE: &str = "delete";
 
 // ---------------------------------------------------------------------------
 // Sort mode
@@ -178,24 +65,46 @@ pub struct FilebrowserProvider {
     /// and the user's `.gitignore`-style files assume.
     show_hidden: bool,
     sort_mode: SortMode,
-    /// Stored between `handle_command("open file with")` and `execute_command`.
-    open_with_path: Option<PathBuf>,
-    /// Unified-timeline emission queue. Currently only populated by
-    /// `delete_item` (with an `FsSideEffect::TrashedFile`/`TrashedDir`
-    /// snapshot). Create/Rename/Paste emissions remain inline in the app
-    /// during the dual-write phase.
-    pending_timeline_entries: Vec<TimelineEntry>,
+    /// Undoable deletes since the last drain, each carrying its snapshot.
+    /// Create, rename and paste are recorded by the app itself.
+    pending_timeline_entries: Vec<ProviderOp>,
+    /// The OS trash, through the host (a fake in the tests).
+    desktop: Box<dyn Desktop>,
+    error: Option<String>,
 }
 
 impl FilebrowserProvider {
-    pub fn new() -> Self {
+    pub fn with_desktop(desktop: Box<dyn Desktop>) -> Self {
         FilebrowserProvider {
             current_path: PathBuf::from("/"),
             show_properties: false,
             show_hidden: false,
             sort_mode: SortMode::Alpha,
-            open_with_path: None,
             pending_timeline_entries: Vec::new(),
+            desktop,
+            error: None,
+        }
+    }
+
+    /// The folder on screen, through any symlinks along its path, as the
+    /// sandbox needs it (see `sicompass_sdk::fs_links`).
+    fn dir(&self) -> PathBuf {
+        self.desktop.resolve(&self.current_path)
+    }
+
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    /// The path an undoable delete names, absolute and recorded at the time:
+    /// the cursor may have moved since, so it is never rebuilt from the
+    /// current directory.
+    fn deleted_path(side_effect: &FsSideEffect) -> Option<&Path> {
+        match side_effect {
+            FsSideEffect::TrashedFile { original_path, .. }
+            | FsSideEffect::TrashedDir { original_path, .. } => Some(original_path),
+            FsSideEffect::RenameOnly { from, .. } => Some(from),
+            FsSideEffect::None => None,
         }
     }
 
@@ -207,7 +116,7 @@ impl FilebrowserProvider {
             }
         }
         let path = &self.current_path;
-        let mut raw = collect_raw_entries(path);
+        let mut raw = collect_raw_entries(&self.desktop.resolve(path), &*self.desktop);
 
         if !self.show_hidden {
             raw.retain(|e| !e.name.starts_with('.'));
@@ -215,7 +124,7 @@ impl FilebrowserProvider {
 
         match self.sort_mode {
             SortMode::Alpha => raw.sort_by(|a, b| natord::compare_ignore_case(&a.name, &b.name)),
-            SortMode::Chrono => raw.sort_by(|a, b| b.mtime.cmp(&a.mtime)),
+            SortMode::Chrono => raw.sort_by_key(|e| std::cmp::Reverse(e.mtime)),
         }
 
         let mut out = Vec::with_capacity(raw.len());
@@ -243,25 +152,39 @@ impl FilebrowserProvider {
     }
 }
 
-impl Default for FilebrowserProvider {
-    fn default() -> Self {
-        Self::new()
+impl Plugin for FilebrowserProvider {
+    fn new() -> Self {
+        FilebrowserProvider::with_desktop(Box::new(HostDesktop))
     }
-}
 
-#[async_trait::async_trait]
-impl Provider for FilebrowserProvider {
-    fn name(&self) -> &str {
-        "filebrowser"
-    }
-    fn display_name(&self) -> String {
-        register_translations();
-        localize::t("filebrowser-display-name")
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: "filebrowser".to_owned(),
+            display_name: localize::t("filebrowser-display-name"),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            // The generic structural-edit keymap. Ctrl+D and Delete still reach
+            // the app's file delete, and Ctrl+X/Ctrl+V its file clipboard.
+            supports_structural_edit: true,
+            path_is_filesystem: true,
+            ..Default::default()
+        }
     }
 
     fn init(&mut self) {
         self.current_path = PathBuf::from("/");
-        cleanup_clipboard_cache();
+        if let Some(v) = sicompass_pdk::host::get_setting("sortOrder") {
+            self.on_setting_change("sortOrder", &v);
+        }
+    }
+
+    fn poll(&mut self) -> sicompass_pdk::PollResult {
+        sicompass_pdk::PollResult {
+            at_root: self.current_path == Path::new("/"),
+            error: self.take_error(),
+            structural_edit_here: true,
+            dashboard_here: false,
+            ..Default::default()
+        }
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
@@ -306,24 +229,6 @@ impl Provider for FilebrowserProvider {
         self.current_path = PathBuf::from(path);
     }
 
-    fn needs_refresh(&self) -> bool {
-        false
-    }
-
-    /// The file browser is where the generic structural-edit keymap was first
-    /// wired, back when the app recognised it by name. It declares the
-    /// capability so those checks can be about what a provider *does* rather
-    /// than what it is called. Behaviour is unchanged: Ctrl+D and Delete still
-    /// reach `handle_file_delete` (`avail_ffon_delete` excludes providers that
-    /// route delete to disk), and Ctrl+X/Ctrl+V still reach the file clipboard.
-    fn supports_structural_edit(&self) -> bool {
-        true
-    }
-
-    fn path_is_filesystem(&self) -> bool {
-        true
-    }
-
     fn on_setting_change(&mut self, key: &str, value: &str) {
         if key == "sortOrder" {
             self.sort_mode = match value {
@@ -355,12 +260,11 @@ impl Provider for FilebrowserProvider {
         if old_name == new_name {
             return false;
         }
-        let old_path = self
-            .current_path
-            .join(old_name.trim_end_matches('/').trim_end_matches('\\'));
-        let new_path = self
-            .current_path
-            .join(new_name.trim_end_matches('/').trim_end_matches('\\'));
+        // The folder through any symlinks, the entries themselves as they are:
+        // renaming a link renames the link.
+        let dir = self.dir();
+        let old_path = dir.join(old_name.trim_end_matches('/').trim_end_matches('\\'));
+        let new_path = dir.join(new_name.trim_end_matches('/').trim_end_matches('\\'));
         std::fs::rename(&old_path, &new_path).is_ok()
     }
 
@@ -370,89 +274,56 @@ impl Provider for FilebrowserProvider {
             .trim_end_matches('/')
             .trim_end_matches('\\')
             .to_owned();
-        let full = self.current_path.join(&name_clean);
+        let full = self.dir().join(&name_clean);
 
         // Snapshot the target before deletion so an undo can restore even if
-        // the OS trash has been emptied (see `sicompass_sdk::fs_trash`).
-        let is_dir = std::fs::metadata(&full)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        let side_effect = sicompass_sdk::fs_trash::snapshot_for_delete(&full);
-        if trash_delete(&full).is_ok() {
-            let before_elem = if is_dir {
-                FfonElement::new_obj(&name_clean)
-            } else {
-                FfonElement::new_str(name_clean.clone())
-            };
-            self.pending_timeline_entries.push(TimelineEntry::FsOp {
-                provider_idx: 0, // patched by app
-                id: sicompass_sdk::ffon::IdArray::new(),
-                op: FsOpKind::Delete,
-                before: Some(before_elem),
-                after: None,
-                side_effect,
-            });
-            true
-        } else {
-            false
+        // the OS trash has been emptied (see `sicompass_sdk::fs_snapshot`).
+        let side_effect = fs_snapshot::snapshot_for_delete(&full);
+        if self.desktop.trash(&full).is_err() {
+            return false;
         }
+        self.pending_timeline_entries.push(ProviderOp {
+            command: OP_DELETE.to_owned(),
+            payload: encode_side_effect(&side_effect),
+            label: format!("delete {name_clean}"),
+        });
+        true
     }
 
-    fn take_timeline_entries(&mut self) -> Vec<TimelineEntry> {
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
         std::mem::take(&mut self.pending_timeline_entries)
     }
 
-    async fn undo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        let (op, side_effect) = match entry {
-            TimelineEntry::FsOp {
-                op, side_effect, ..
-            } => (op, side_effect),
-            _ => return,
+    /// Put a deleted item back: its snapshot, or the OS trash when it was too
+    /// large to keep.
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let Some(side_effect) = decode_side_effect(entry) else {
+            return Ok(());
         };
-        if !matches!(op, FsOpKind::Delete) {
-            return;
-        }
-        sicompass_sdk::fs_trash::restore_side_effect(side_effect, error);
+        let desktop = &self.desktop;
+        fs_snapshot::restore(&side_effect, |p| desktop.restore(p))
     }
 
-    async fn redo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        register_translations();
-        let (op, side_effect) = match entry {
-            TimelineEntry::FsOp {
-                op, side_effect, ..
-            } => (op, side_effect),
-            _ => return,
+    /// Move it to the trash again, at the absolute path recorded at the time.
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let Some(side_effect) = decode_side_effect(entry) else {
+            return Ok(());
         };
-        if !matches!(op, FsOpKind::Delete) {
-            return;
-        }
-        // Re-trash the item at its absolute original path (recorded in the
-        // side effect when it was first deleted). Joining `current_path` with
-        // the name would be wrong — the cursor may have moved since the
-        // delete, so it could miss the file entirely or, worse, trash a
-        // same-named file in the wrong directory.
-        let path: Option<&Path> = match side_effect {
-            FsSideEffect::TrashedFile { original_path, .. }
-            | FsSideEffect::TrashedDir { original_path, .. } => Some(original_path),
-            FsSideEffect::RenameOnly { from, .. } => Some(from),
-            FsSideEffect::None => None,
+        let Some(path) = Self::deleted_path(&side_effect) else {
+            return Ok(());
         };
-        if let Some(path) = path {
-            if let Err(e) = trash_delete(path) {
-                register_translations();
-                let mut args = localize::Args::new();
-                args.set("err", e.to_string());
-                *error = localize::t_args("filebrowser-error-redo-delete-trash-failed", &args);
-            }
-        }
+        self.desktop.trash(path).map_err(|e| {
+            let mut args = localize::Args::new();
+            args.set("err", e);
+            localize::t_args("filebrowser-error-redo-delete-trash-failed", &args)
+        })
     }
 
     fn create_directory(&mut self, name: &str) -> bool {
         if name.is_empty() {
             return false;
         }
-        let full = self.current_path.join(name);
+        let full = self.dir().join(name);
         std::fs::create_dir(&full).is_ok()
     }
 
@@ -460,7 +331,7 @@ impl Provider for FilebrowserProvider {
         if name.is_empty() {
             return false;
         }
-        let full = self.current_path.join(name);
+        let full = self.dir().join(name);
         std::fs::File::create(&full).is_ok()
     }
 
@@ -471,8 +342,14 @@ impl Provider for FilebrowserProvider {
         dest_dir: &str,
         dest_name: &str,
     ) -> bool {
-        let src = Path::new(src_dir).join(src_name.trim_end_matches('/').trim_end_matches('\\'));
-        let dst = Path::new(dest_dir).join(dest_name.trim_end_matches('/').trim_end_matches('\\'));
+        let src = self
+            .desktop
+            .resolve(Path::new(src_dir))
+            .join(src_name.trim_end_matches('/').trim_end_matches('\\'));
+        let dst = self
+            .desktop
+            .resolve(Path::new(dest_dir))
+            .join(dest_name.trim_end_matches('/').trim_end_matches('\\'));
         copy_recursive(&src, &dst)
     }
 
@@ -480,7 +357,6 @@ impl Provider for FilebrowserProvider {
         vec![
             "create directory".into(),
             "create file".into(),
-            "open file with".into(),
             "show/hide properties".into(),
             "show/hide hidden files".into(),
             "sort alphanumerically".into(),
@@ -491,12 +367,10 @@ impl Provider for FilebrowserProvider {
     fn handle_command(
         &mut self,
         command: &str,
-        element_key: &str,
-        element_type: i32,
-        error: &mut String,
-    ) -> Option<FfonElement> {
-        register_translations();
-        match command {
+        _element_key: &str,
+        _element_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        Ok(match command {
             "create directory" => Some(new_obj_with_i_placeholder("<input></input>")),
             "create file" => Some(FfonElement::Str("<input></input>".into())),
             "show/hide properties" => {
@@ -515,59 +389,39 @@ impl Provider for FilebrowserProvider {
                 self.sort_mode = SortMode::Chrono;
                 None
             }
-            "open file with" => {
-                // element_type 1 = FFON_OBJECT (directory) — reject directories
-                if element_type == 1 {
-                    register_translations();
-                    *error = localize::t("filebrowser-error-open-with-not-file");
-                    return None;
-                }
-                let filename = entry_name(element_key);
-                if filename.is_empty() {
-                    register_translations();
-                    *error = localize::t("filebrowser-error-open-with-no-filename");
-                    return None;
-                }
-                self.open_with_path = Some(self.current_path.join(&filename));
-                None
-            }
             _ => None,
-        }
+        })
     }
 
-    fn command_list_items(&self, command: &str) -> Vec<ListItem> {
-        if command != "open file with" {
-            return Vec::new();
-        }
-        sicompass_sdk::platform::get_applications()
-            .into_iter()
-            .map(|a| ListItem {
-                label: a.name,
-                data: a.exec,
-            })
-            .collect()
-    }
-
-    fn execute_command(&mut self, command: &str, selection: &str) -> bool {
-        if command == "open file with" {
-            if let Some(path) = &self.open_with_path {
-                let path_str = path.to_string_lossy().into_owned();
-                return sicompass_sdk::platform::open_with(selection, &path_str);
-            }
-        }
-        false
-    }
-
-    fn collect_extended_search_items(&self) -> Option<Vec<SearchResultItem>> {
+    fn collect_extended_search_items(&self) -> Option<Vec<SearchResult>> {
         Some(self.run_extended_search())
     }
 }
 
+export_plugin!(FilebrowserProvider);
+
+/// A delete's snapshot, as a `ProviderOp` payload: FFON text, so the bytes
+/// travel base64-encoded.
+fn encode_side_effect(side_effect: &FsSideEffect) -> Vec<u8> {
+    let text = B64.encode(fs_snapshot::encode(side_effect));
+    sicompass_pdk::encode_one(&FfonElement::Str(text))
+}
+
+/// The inverse; `None` for an entry that is not one of this plugin's deletes.
+fn decode_side_effect(entry: &ProviderOp) -> Option<FsSideEffect> {
+    if entry.command != OP_DELETE {
+        return None;
+    }
+    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let bytes = B64.decode(payload.as_str()?).ok()?;
+    fs_snapshot::decode(&bytes)
+}
+
 impl FilebrowserProvider {
-    fn run_extended_search(&self) -> Vec<SearchResultItem> {
+    fn run_extended_search(&self) -> Vec<SearchResult> {
         const MAX_ITEMS: usize = 50_000;
         let mut results = Vec::new();
-        let root = self.current_path.clone();
+        let root = self.dir();
 
         // BFS queue: (dir_path, breadcrumb)
         let mut queue: std::collections::VecDeque<(PathBuf, String)> =
@@ -579,16 +433,15 @@ impl FilebrowserProvider {
                 break;
             }
 
-            let rd = match std::fs::read_dir(&dir) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let Ok(names) = sicompass_pdk::fs::list_dir(&dir) else {
+                continue;
             };
 
-            for entry in rd.flatten() {
+            for name in names {
                 if results.len() >= MAX_ITEMS {
                     break;
                 }
-                let name = entry.file_name().to_string_lossy().into_owned();
+                let entry_path = dir.join(&name);
                 // Agree with `list_directory`: an extended search that surfaced the
                 // contents of `.git` while the listing hides it would be both
                 // confusing and, on a large repo, most of the item budget.
@@ -596,7 +449,7 @@ impl FilebrowserProvider {
                     continue;
                 }
                 // Use symlink_metadata to avoid following symlinks (guards against loops)
-                let meta = match entry.path().symlink_metadata() {
+                let meta = match entry_path.clone().symlink_metadata() {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -606,8 +459,8 @@ impl FilebrowserProvider {
                 } else {
                     format!("- {name}")
                 };
-                let nav_path = entry.path().to_string_lossy().into_owned();
-                results.push(SearchResultItem {
+                let nav_path = entry_path.clone().to_string_lossy().into_owned();
+                results.push(SearchResult {
                     label,
                     breadcrumb: breadcrumb.clone(),
                     nav_path: nav_path.clone(),
@@ -619,7 +472,7 @@ impl FilebrowserProvider {
                     } else {
                         format!("{breadcrumb}{name} > ")
                     };
-                    queue.push_back((entry.path(), child_bc));
+                    queue.push_back((entry_path.clone(), child_bc));
                 }
             }
         }
@@ -663,20 +516,23 @@ fn entry_name(label: &str) -> String {
     }
 }
 
-fn collect_raw_entries(path: &Path) -> Vec<RawEntry> {
-    let rd = match std::fs::read_dir(path) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+/// The entries of `path`, through `sicompass_pdk::fs::list_dir`: in a folder
+/// other programs change, `std::fs::read_dir` inside the sandbox stops at the
+/// first entry that vanished and loses every entry after it. An entry that
+/// vanishes between listing and reading its metadata is left out.
+fn collect_raw_entries(path: &Path, desktop: &dyn Desktop) -> Vec<RawEntry> {
+    let Ok(names) = sicompass_pdk::fs::list_dir(path) else {
+        return Vec::new();
     };
 
     let mut entries = Vec::new();
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        // `DirEntry::metadata` does not traverse symlinks, which is what we
+    for name in names {
+        let entry_path = path.join(&name);
+        // `symlink_metadata` does not traverse symlinks, which is what we
         // want for the *properties* view: `format_properties` renders the
         // link's own mode as a leading `l`, and its own size and mtime, the
         // way `ls -l` does.
-        let meta = match e.metadata() {
+        let meta = match std::fs::symlink_metadata(&entry_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -688,7 +544,7 @@ fn collect_raw_entries(path: &Path) -> Vec<RawEntry> {
         // without this the listing contradicts them. A broken link resolves to
         // nothing and stays a plain entry.
         let is_dir = if meta.file_type().is_symlink() {
-            std::fs::metadata(e.path())
+            std::fs::metadata(desktop.resolve(&entry_path))
                 .map(|m| m.is_dir())
                 .unwrap_or(false)
         } else {
@@ -725,6 +581,9 @@ fn collect_raw_entries(path: &Path) -> Vec<RawEntry> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
+// The `libc::S_*` casts are no-ops on Linux but not on macOS, where the
+// constants are `u16`; one source for both.
+#[allow(clippy::unnecessary_cast)]
 fn format_properties(e: &RawEntry) -> String {
     use libc::{getgrgid, getpwuid};
     use std::ffi::CStr;
@@ -816,9 +675,9 @@ fn format_properties(e: &RawEntry) -> String {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&mtime_secs, &mut tm);
         let fmt = if now - mtime_secs < 6 * 30 * 24 * 3600 {
-            b"%b %e %H:%M\0".as_ptr() as *const libc::c_char
+            c"%b %e %H:%M".as_ptr()
         } else {
-            b"%b %e  %Y\0".as_ptr() as *const libc::c_char
+            c"%b %e  %Y".as_ptr()
         };
         let mut buf = [0i8; 16];
         libc::strftime(buf.as_mut_ptr(), buf.len(), fmt, &tm);
@@ -927,90 +786,117 @@ fn list_drives() -> Vec<FfonElement> {
 }
 
 // ---------------------------------------------------------------------------
-// Clipboard cache cleanup stub
-// ---------------------------------------------------------------------------
-
-fn cleanup_clipboard_cache() {
-    // C version cleans up stale clipboard file copies on init.
-    // In Rust we use in-memory clipboard (AppRenderer.clipboard) so there's
-    // nothing to clean up here.
-}
-
-// ---------------------------------------------------------------------------
 // Tests — port of tests/lib_filebrowser/ (25 + 27 tests)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sicompass_sdk::fs_trash::TRASH_SNAPSHOT_LIMIT_BYTES;
-    use sicompass_sdk::tags;
+    use sicompass_sdk::fs_snapshot::TRASH_SNAPSHOT_LIMIT_BYTES;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tempfile::TempDir;
+
+    /// The OS trash, simulated: a trashed item is moved into a folder of its
+    /// own and can be restored from it, newest first. Nothing a test deletes
+    /// ever reaches the developer's real trash.
+    #[derive(Clone, Default)]
+    struct FakeDesktop(Rc<RefCell<FakeTrash>>);
+
+    #[derive(Default)]
+    struct FakeTrash {
+        dir: Option<TempDir>,
+        /// (original path, where it is kept), oldest first.
+        items: Vec<(PathBuf, PathBuf)>,
+        restores: Vec<PathBuf>,
+        /// Answer restores with this refusal, as macOS's trash does.
+        refuse_restore: Option<String>,
+    }
+
+    impl Desktop for FakeDesktop {
+        fn trash(&self, path: &Path) -> Result<(), String> {
+            let mut t = self.0.borrow_mut();
+            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let dir = t
+                .dir
+                .get_or_insert_with(|| TempDir::new().unwrap())
+                .path()
+                .to_path_buf();
+            let kept = dir.join(t.items.len().to_string());
+            std::fs::rename(path, &kept).map_err(|e| e.to_string())?;
+            t.items.push((path.to_path_buf(), kept));
+            Ok(())
+        }
+
+        fn restore(&self, path: &Path) -> Result<(), String> {
+            let mut t = self.0.borrow_mut();
+            t.restores.push(path.to_path_buf());
+            if let Some(why) = &t.refuse_restore {
+                return Err(why.clone());
+            }
+            let at = t
+                .items
+                .iter()
+                .rposition(|(orig, _)| orig == path)
+                .ok_or("no matching item in the trash")?;
+            let (orig, kept) = t.items.remove(at);
+            std::fs::rename(kept, orig).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A file browser on the fake trash.
+    fn fb() -> FilebrowserProvider {
+        FilebrowserProvider::with_desktop(Box::new(FakeDesktop::default()))
+    }
+
+    fn fb_on(desktop: &FakeDesktop) -> FilebrowserProvider {
+        FilebrowserProvider::with_desktop(Box::new(desktop.clone()))
+    }
 
     fn make_provider() -> (FilebrowserProvider, TempDir) {
         let dir = TempDir::new().unwrap();
-        let mut p = FilebrowserProvider::new();
+        let mut p = fb();
         p.set_current_path(dir.path().to_str().unwrap());
         (p, dir)
     }
 
-    /// Lets the calling test — and only it — reach the real OS trash, restoring
-    /// the stub on drop so a panic cannot leave the thread opted out.
-    ///
-    /// Deliberately not a process-global flag with a `Mutex`, which is the
-    /// shape the older stubs use. A `Mutex` serialises the tests that *take*
-    /// it, but every other delete test keeps running in parallel and reads the
-    /// same global: measured, one opted-out test put two other tests' fixtures
-    /// (`a`, `doomed.txt`) in the developer's real trash. Thread-local scoping
-    /// is exact, because the harness gives every test its own thread.
-    struct RealTrashAllowed;
-
-    impl RealTrashAllowed {
-        fn new() -> Self {
-            ALLOW_REAL_TRASH.with(|a| a.set(true));
-            Self
-        }
-    }
-
-    impl Drop for RealTrashAllowed {
-        fn drop(&mut self) {
-            ALLOW_REAL_TRASH.with(|a| a.set(false));
-        }
-    }
-
-    /// No in-crate test may reach the developer's real OS trash.
-    ///
-    /// Nothing forces a delete test to opt into safety — the sink is a free
-    /// function with no per-instance override — so the `cfg!(test)` default is
-    /// the whole defence. Without it, about a thousand runs put 37 850 fixtures
-    /// (`aaa`, `doomed.txt`, `undotest.txt`) in a real 45 479-entry trash.
+    /// Outside the sandbox there is no trash at all: the plugin's own host
+    /// desktop refuses rather than deleting anything, so a native test can only
+    /// ever reach the fake.
     #[test]
-    fn no_unit_test_can_reach_the_real_trash() {
-        assert!(
-            test_no_trash(),
-            "the compile-time default must keep unit tests out of the OS trash"
-        );
-
-        // And the stub must still actually delete, or every `!path.exists()`
-        // assertion in this module is inert.
+    fn natively_the_host_desktop_touches_nothing() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("x.txt");
         std::fs::write(&file, b"x").unwrap();
-        assert!(trash_delete(&file).is_ok());
-        assert!(!file.exists(), "the stub must remove the file, not skip it");
+        assert!(HostDesktop.trash(&file).is_err());
+        assert!(file.exists());
+        let mut p = FilebrowserProvider::new();
+        p.set_current_path(dir.path().to_str().unwrap());
+        assert!(
+            !p.delete_item("x.txt"),
+            "a delete the trash refused is not done"
+        );
+        assert!(file.exists());
+    }
 
+    /// The fake must really take the item away, or every `!path.exists()`
+    /// assertion in this module is inert; and a path that is not there stays
+    /// an error, so `delete_item` keeps returning false for it.
+    #[test]
+    fn the_fake_trash_takes_items_away() {
+        let dir = TempDir::new().unwrap();
+        let d = FakeDesktop::default();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"x").unwrap();
+        d.trash(&file).unwrap();
+        assert!(!file.exists());
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("inner"), b"x").unwrap();
-        assert!(trash_delete(&sub).is_ok());
-        assert!(!sub.exists(), "the stub must remove directories recursively");
-
-        // A path that is not there stays an error, so `delete_item` keeps
-        // returning false for it (see `test_delete_nonexistent_returns_false`).
-        assert!(trash_delete(&dir.path().join("never-existed")).is_err());
+        d.trash(&sub).unwrap();
+        assert!(!sub.exists());
+        assert!(d.trash(&dir.path().join("never-existed")).is_err());
     }
-
-    // ---- fetch structure ---------------------------------------------------
 
     #[test]
     fn test_fetch_empty_dir_only_meta() {
@@ -1183,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_pop_at_root_is_noop() {
-        let mut p = FilebrowserProvider::new();
+        let mut p = fb();
         p.pop_path();
         assert_eq!(p.current_path(), "/");
     }
@@ -1192,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_commands_list() {
-        let p = FilebrowserProvider::new();
+        let p = fb();
         let cmds = p.commands();
         assert!(cmds.contains(&"create directory".to_string()));
         assert!(cmds.contains(&"create file".to_string()));
@@ -1202,8 +1088,7 @@ mod tests {
     #[test]
     fn test_handle_command_create_file_returns_input_elem() {
         let (mut p, _dir) = make_provider();
-        let mut err = String::new();
-        let result = p.handle_command("create file", "", 0, &mut err);
+        let result = p.handle_command("create file", "", 0).unwrap();
         assert!(result.is_some());
         let elem = result.unwrap();
         assert!(elem.as_str().is_some());
@@ -1212,8 +1097,7 @@ mod tests {
     #[test]
     fn test_handle_command_create_directory_returns_obj() {
         let (mut p, _dir) = make_provider();
-        let mut err = String::new();
-        let result = p.handle_command("create directory", "", 0, &mut err);
+        let result = p.handle_command("create directory", "", 0).unwrap();
         let elem = result.unwrap();
         let obj = elem.as_obj().expect("create directory must return an Obj");
         assert_eq!(
@@ -1288,10 +1172,9 @@ mod tests {
     fn test_handle_command_toggle_properties() {
         let (mut p, _dir) = make_provider();
         assert!(!p.show_properties);
-        let mut err = String::new();
-        p.handle_command("show/hide properties", "", 0, &mut err);
+        p.handle_command("show/hide properties", "", 0).unwrap();
         assert!(p.show_properties);
-        p.handle_command("show/hide properties", "", 0, &mut err);
+        p.handle_command("show/hide properties", "", 0).unwrap();
         assert!(!p.show_properties);
     }
 
@@ -1313,10 +1196,9 @@ mod tests {
     fn test_handle_command_toggle_hidden_files() {
         let (mut p, _dir) = make_provider();
         assert!(!p.show_hidden, "hidden files are off by default");
-        let mut err = String::new();
-        p.handle_command("show/hide hidden files", "", 0, &mut err);
+        p.handle_command("show/hide hidden files", "", 0).unwrap();
         assert!(p.show_hidden);
-        p.handle_command("show/hide hidden files", "", 0, &mut err);
+        p.handle_command("show/hide hidden files", "", 0).unwrap();
         assert!(!p.show_hidden);
     }
 
@@ -1332,8 +1214,7 @@ mod tests {
         assert!(!labels.iter().any(|l| l == ".DS_Store"));
         assert!(!labels.iter().any(|l| l == ".git"));
 
-        let mut err = String::new();
-        p.handle_command("show/hide hidden files", "", 0, &mut err);
+        p.handle_command("show/hide hidden files", "", 0).unwrap();
         let labels = entry_names(&mut p);
         assert!(labels.iter().any(|l| l == ".DS_Store"));
         assert!(labels.iter().any(|l| l == ".git"));
@@ -1357,8 +1238,7 @@ mod tests {
             "hidden directories must not be descended into"
         );
 
-        let mut err = String::new();
-        p.handle_command("show/hide hidden files", "", 0, &mut err);
+        p.handle_command("show/hide hidden files", "", 0).unwrap();
         let results = p.collect_extended_search_items().unwrap_or_default();
         assert!(results.iter().any(|r| r.label.contains(".git")));
         assert!(results.iter().any(|r| r.label.contains("config")));
@@ -1390,6 +1270,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Through a symlink with an absolute target, which the sandbox does not
+    /// follow on its own: still a folder, and its contents still list.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_reached_through_an_absolute_link_lists_its_contents() {
+        let (mut p, dir) = make_provider();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(real.join("actual")).unwrap();
+        std::fs::write(real.join("actual/11.json"), "[]").unwrap();
+        std::os::unix::fs::symlink(real.join("actual"), real.join("via-link")).unwrap();
+
+        let top = p.fetch();
+        assert!(
+            top.iter()
+                .any(|e| matches!(e, FfonElement::Obj(o) if o.key.contains("via-link")))
+        );
+        p.push_path("via-link");
+        let inside = p.fetch();
+        assert!(
+            inside
+                .iter()
+                .any(|e| e.as_str().is_some_and(|s| s.contains("11.json"))),
+            "{inside:?}"
+        );
+    }
+
     #[test]
     fn test_broken_symlink_is_not_a_directory() {
         let (mut p, dir) = make_provider();
@@ -1427,10 +1333,9 @@ mod tests {
     #[test]
     fn test_handle_command_sort_chrono() {
         let (mut p, _dir) = make_provider();
-        let mut err = String::new();
-        p.handle_command("sort chronologically", "", 0, &mut err);
+        p.handle_command("sort chronologically", "", 0).unwrap();
         assert_eq!(p.sort_mode, SortMode::Chrono);
-        p.handle_command("sort alphanumerically", "", 0, &mut err);
+        p.handle_command("sort alphanumerically", "", 0).unwrap();
         assert_eq!(p.sort_mode, SortMode::Alpha);
     }
 
@@ -1469,8 +1374,7 @@ mod tests {
         std::fs::write(dir.path().join("cherry.txt"), b"").unwrap();
         std::fs::write(dir.path().join("apple.txt"), b"").unwrap();
         std::fs::write(dir.path().join("banana.txt"), b"").unwrap();
-        let mut err = String::new();
-        p.handle_command("sort alphanumerically", "", 0, &mut err);
+        p.handle_command("sort alphanumerically", "", 0).unwrap();
         assert_eq!(p.sort_mode, SortMode::Alpha);
         let items = p.fetch();
         let file_labels: Vec<_> = items
@@ -1487,8 +1391,7 @@ mod tests {
         std::fs::write(dir.path().join("file10.txt"), b"").unwrap();
         std::fs::write(dir.path().join("file2.txt"), b"").unwrap();
         std::fs::write(dir.path().join("file1.txt"), b"").unwrap();
-        let mut err = String::new();
-        p.handle_command("sort alphanumerically", "", 0, &mut err);
+        p.handle_command("sort alphanumerically", "", 0).unwrap();
         let items = p.fetch();
         let file_labels: Vec<_> = items
             .iter()
@@ -1503,21 +1406,9 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_command_open_with_directory_error() {
-        let (mut p, _dir) = make_provider();
-        let mut err = String::new();
-        // element_type 1 = FFON_OBJECT (directory)
-        let result = p.handle_command("open file with", "<input>somedir</input>", 1, &mut err);
-        assert!(result.is_none());
-        assert!(!err.is_empty(), "error should be set for directory");
-        assert!(err.contains("directory"), "error should mention directory");
-    }
-
-    #[test]
     fn test_handle_command_unknown() {
         let (mut p, _dir) = make_provider();
-        let mut err = String::new();
-        let result = p.handle_command("nonexistent command", "", 0, &mut err);
+        let result = p.handle_command("nonexistent command", "", 0).unwrap();
         assert!(result.is_none());
     }
 
@@ -1597,7 +1488,7 @@ mod tests {
 
     #[test]
     fn test_fetch_nonexistent_path_returns_only_meta() {
-        let mut p = FilebrowserProvider::new();
+        let mut p = fb();
         p.set_current_path("/nonexistent/path/xyz/abc");
         let items = p.fetch();
         // On a nonexistent path the listing is empty
@@ -1651,13 +1542,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_commands_returns_seven() {
-        let p = FilebrowserProvider::new();
+    fn test_get_commands_returns_six() {
+        let p = fb();
         let cmds = p.commands();
-        assert_eq!(cmds.len(), 7);
+        assert_eq!(cmds.len(), 6);
         assert!(cmds.contains(&"create directory".to_string()));
         assert!(cmds.contains(&"create file".to_string()));
-        assert!(cmds.contains(&"open file with".to_string()));
+        // Not in the sandbox: it cannot list the system's applications.
+        assert!(!cmds.contains(&"open file with".to_string()));
         assert!(cmds.contains(&"show/hide properties".to_string()));
         assert!(cmds.contains(&"show/hide hidden files".to_string()));
         assert!(cmds.contains(&"sort alphanumerically".to_string()));
@@ -1665,35 +1557,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_command_list_items_open_with_no_apps() {
-        // When no desktop apps are found, open_with returns empty list.
-        let (mut p, dir) = make_provider();
-        std::fs::write(dir.path().join("test.txt"), b"").unwrap();
-        // Prime open_with_path via handle_command
-        let mut err = String::new();
-        p.handle_command("open file with", "<input>test.txt</input>", 0, &mut err);
-        // command_list_items queries the platform for apps; on headless CI this returns empty
-        let items = p.command_list_items("open file with");
-        // Either empty (no apps found in CI) or non-empty (apps found) — just must not panic.
-        let _ = items; // no crash is the assertion
-    }
-
-    #[test]
     fn test_provider_path_starts_at_root() {
         // On non-Windows, the initial path is "/".
         #[cfg(not(windows))]
         {
-            let p = FilebrowserProvider::new();
+            let p = fb();
             assert_eq!(p.current_path(), "/");
         }
-    }
-
-    // ---- cleanup_clipboard_cache -------------------------------------------
-
-    #[test]
-    fn test_cleanup_clipboard_cache_no_crash() {
-        // Should be a no-op in Rust (we use in-memory clipboard), must not panic.
-        cleanup_clipboard_cache();
     }
 
     // ---- chrono sort ordering ----------------------------------------------
@@ -1754,38 +1624,6 @@ mod tests {
         assert_eq!(items.len(), 2, "expected 2 files, got {}", items.len());
     }
 
-    // ---- execute_command open file with ------------------------------------
-
-    #[test]
-    fn test_execute_command_open_with_no_path_returns_false() {
-        // Without first calling handle_command to set the path, execute should return false.
-        let (mut p, _dir) = make_provider();
-        let result = p.execute_command("open file with", "firefox");
-        assert!(
-            !result,
-            "execute_command should return false when no path is set"
-        );
-    }
-
-    #[test]
-    fn test_execute_command_open_with_sets_path_then_executes() {
-        // handle_command stores the path; execute_command calls open_with.
-        // We can't test the actual open_with call (platform-specific) but we can
-        // verify the function accepts the call without panicking.
-        let (mut p, dir) = make_provider();
-        std::fs::write(dir.path().join("test.txt"), b"content").unwrap();
-        let mut err = String::new();
-        p.handle_command("open file with", "<input>test.txt</input>", 0, &mut err);
-        // open_with_path should now be set
-        assert!(
-            p.open_with_path.is_some(),
-            "open_with_path should be set after handle_command"
-        );
-        // execute_command will call platform::open_with — result depends on platform
-        let _ = p.execute_command("open file with", "xdg-open");
-        // No panic = pass
-    }
-
     #[test]
     #[cfg(unix)]
     fn test_fetch_symlink_appears_in_listing() {
@@ -1805,63 +1643,65 @@ mod tests {
         assert!(names.contains(&"link.txt".to_string()));
     }
 
-    // -- FsOp::Delete emission + snapshot undo --------------------------------
+    // -- Undoable delete: a ProviderOp carrying the snapshot ----------------
+
+    fn snapshot_of(entry: &ProviderOp) -> FsSideEffect {
+        assert_eq!(entry.command, OP_DELETE);
+        decode_side_effect(entry).expect("the payload decodes")
+    }
 
     #[test]
-    fn delete_item_emits_fsop_with_file_snapshot() {
+    fn delete_item_records_an_undo_with_the_file_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("doomed.txt");
         std::fs::write(&target, b"important content").unwrap();
 
-        let mut p = FilebrowserProvider::new();
+        let mut p = fb();
         p.set_current_path(tmp.path().to_str().unwrap());
         assert!(p.delete_item("doomed.txt"));
 
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            TimelineEntry::FsOp {
-                op,
-                side_effect,
-                before,
-                ..
+        assert!(
+            entries[0].label.contains("doomed.txt"),
+            "{}",
+            entries[0].label
+        );
+        match snapshot_of(&entries[0]) {
+            FsSideEffect::TrashedFile {
+                content_snapshot,
+                original_path,
             } => {
-                assert_eq!(*op, FsOpKind::Delete);
-                assert!(matches!(before, Some(FfonElement::Str(_))));
-                match side_effect {
-                    FsSideEffect::TrashedFile {
-                        content_snapshot, ..
-                    } => {
-                        assert_eq!(content_snapshot, b"important content");
-                    }
-                    other => panic!("expected TrashedFile, got {:?}", other),
-                }
+                assert_eq!(content_snapshot, b"important content");
+                assert_eq!(original_path, target);
             }
-            other => panic!("expected FsOp, got {:?}", other),
+            other => panic!("expected TrashedFile, got {other:?}"),
         }
     }
 
     #[test]
-    fn undo_fsop_delete_restores_file_from_snapshot() {
+    fn undo_restores_a_deleted_file_from_its_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("doomed.txt");
         std::fs::write(&target, b"restore me").unwrap();
 
-        let mut p = FilebrowserProvider::new();
+        let desktop = FakeDesktop::default();
+        let mut p = fb_on(&desktop);
         p.set_current_path(tmp.path().to_str().unwrap());
         assert!(p.delete_item("doomed.txt"));
         assert!(!target.exists(), "file is gone from disk");
 
         let entries = p.take_timeline_entries();
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
-        assert!(err.is_empty(), "undo error: {err}");
-        assert!(target.exists(), "file restored");
+        p.undo(&entries[0]).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"restore me");
+        assert!(
+            desktop.0.borrow().restores.is_empty(),
+            "a snapshot never needs the trash"
+        );
     }
 
     #[test]
-    fn undo_fsop_delete_restores_directory_tree() {
+    fn undo_restores_a_deleted_directory_tree() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("a");
         std::fs::create_dir(&dir).unwrap();
@@ -1870,115 +1710,100 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("deep.txt"), b"deeper").unwrap();
 
-        let mut p = FilebrowserProvider::new();
+        let mut p = fb();
         p.set_current_path(tmp.path().to_str().unwrap());
         assert!(p.delete_item("a"));
         assert!(!dir.exists());
 
         let entries = p.take_timeline_entries();
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
-        assert!(err.is_empty(), "undo error: {err}");
-        assert!(dir.exists() && dir.is_dir());
+        p.undo(&entries[0]).unwrap();
+        assert!(dir.is_dir());
         assert_eq!(std::fs::read(dir.join("inner.txt")).unwrap(), b"nested");
         assert_eq!(std::fs::read(sub.join("deep.txt")).unwrap(), b"deeper");
     }
 
+    /// Too large to snapshot: the undo asks the trash (`desktop.restore`), and
+    /// where the trash cannot restore (macOS) it says so and names the file.
     #[test]
-    fn undo_fsop_delete_restores_oversized_file_from_os_trash() {
-        // The only test in the workspace that needs the *real* OS trash: an
-        // oversized delete records `RenameOnly`, so undo has no snapshot to
-        // replay and must fall back to `fs_trash::restore_from_os_trash`,
-        // which only knows the real one. Nothing else here opts out, and on
-        // Linux the `.cargo/config.toml` XDG sandbox keeps even this one out of
-        // the developer's own trash.
-        let _allow = RealTrashAllowed::new();
-
+    fn undo_of_an_oversized_delete_restores_it_from_the_trash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("huge.bin");
-        // Larger than TRASH_SNAPSHOT_LIMIT_BYTES → no in-app snapshot, so the
-        // delete records a `RenameOnly` side effect and undo must fall back to
-        // the OS trash.
         let big = vec![7u8; (TRASH_SNAPSHOT_LIMIT_BYTES + 1024) as usize];
         std::fs::write(&target, &big).unwrap();
 
-        let mut p = FilebrowserProvider::new();
+        let desktop = FakeDesktop::default();
+        let mut p = fb_on(&desktop);
         p.set_current_path(tmp.path().to_str().unwrap());
         assert!(p.delete_item("huge.bin"));
         assert!(!target.exists(), "oversized file is gone from disk");
 
         let entries = p.take_timeline_entries();
-        match &entries[0] {
-            TimelineEntry::FsOp { side_effect, .. } => {
-                assert!(
-                    matches!(side_effect, FsSideEffect::RenameOnly { .. }),
-                    "oversized delete must record RenameOnly, got {side_effect:?}"
-                );
-            }
-            other => panic!("expected FsOp, got {other:?}"),
-        }
+        assert!(
+            matches!(snapshot_of(&entries[0]), FsSideEffect::RenameOnly { .. }),
+            "an oversized delete keeps no snapshot"
+        );
+        assert!(
+            entries[0].payload.len() < 4096,
+            "and its undo payload stays small"
+        );
 
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
+        assert_eq!(desktop.0.borrow().restores, vec![target.clone()]);
+        assert_eq!(std::fs::read(&target).unwrap(), big);
 
-        // The outcome is platform-split because the capability is. `trash`
-        // exposes `os_limited` (and so a programmatic restore) on Windows and
-        // the freedesktop platforms only; on macOS
-        // `fs_trash::restore_from_os_trash` is compiled to an unconditional
-        // `Err`. Asserting the real behaviour on both sides keeps the test
-        // meaningful everywhere instead of silently covering nothing on macOS.
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-        {
-            assert!(
-                err.is_empty(),
-                "undo should auto-restore from OS trash: {err}"
-            );
-            assert!(target.exists(), "oversized file restored from OS trash");
-            assert_eq!(std::fs::read(&target).unwrap(), big);
-        }
-
-        // Where no programmatic restore exists, undo must still fail loudly
-        // and point the user at a manual restore, never silently report
-        // success while leaving the file in the trash.
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-        {
-            assert!(
-                !err.is_empty(),
-                "undo must report an error where OS-trash restore is unsupported"
-            );
-            assert!(
-                err.contains("huge.bin"),
-                "error must name the file the user has to restore: {err}"
-            );
-            assert!(
-                !target.exists(),
-                "file stays in the OS trash when restore is unsupported"
-            );
-        }
+        // Again, on a trash that cannot restore.
+        assert!(p.delete_item("huge.bin"));
+        desktop.0.borrow_mut().refuse_restore = Some("unsupported here".to_owned());
+        let entries = p.take_timeline_entries();
+        let err = p.undo(&entries[0]).unwrap_err();
+        assert!(
+            err.contains("huge.bin") && err.contains("unsupported here"),
+            "{err}"
+        );
+        assert!(!target.exists(), "it stays in the trash");
     }
 
     #[test]
-    fn redo_fsop_delete_removes_file_again() {
+    fn redo_moves_the_file_to_the_trash_again() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("doomed.txt");
         std::fs::write(&target, b"x").unwrap();
 
-        let mut p = FilebrowserProvider::new();
+        let desktop = FakeDesktop::default();
+        let mut p = fb_on(&desktop);
         p.set_current_path(tmp.path().to_str().unwrap());
         assert!(p.delete_item("doomed.txt"));
         let entries = p.take_timeline_entries();
-        let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut err));
+        p.undo(&entries[0]).unwrap();
         assert!(target.exists());
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut err));
-        assert!(err.is_empty(), "redo error: {err}");
+
+        // From somewhere else: the recorded path is used, not the cursor's.
+        p.set_current_path("/");
+        p.redo(&entries[0]).unwrap();
         assert!(!target.exists(), "redo deletes again");
+        assert_eq!(desktop.0.borrow().items.len(), 2);
+    }
+
+    /// Only this plugin's own deletes are undone; anything else on the tab's
+    /// timeline is left alone.
+    #[test]
+    fn an_entry_that_is_not_a_delete_is_ignored() {
+        let mut p = fb();
+        let other = ProviderOp {
+            command: "something-else".to_owned(),
+            payload: sicompass_pdk::encode_one(&FfonElement::Str("x".into())),
+            label: "x".to_owned(),
+        };
+        assert!(p.undo(&other).is_ok());
+        assert!(p.redo(&other).is_ok());
     }
 
     // ---- property formatting ----------------------------------------------
 
     #[cfg(unix)]
     #[test]
+    // The same macOS `u16` casts as in `format_properties`.
+    #[allow(clippy::unnecessary_cast)]
     fn test_format_properties_permission_string() {
         let mk = |mode: u32| RawEntry {
             name: "x".into(),
@@ -2001,22 +1826,4 @@ mod tests {
         let link = format_properties(&mk(libc::S_IFLNK as u32 | 0o777));
         assert!(link.starts_with("lrwxrwxrwx "), "got: {link}");
     }
-}
-
-// ---------------------------------------------------------------------------
-// SDK registration
-// ---------------------------------------------------------------------------
-
-/// Register the file browser with the SDK factory and manifest registries.
-///
-/// The manifest marks the provider as `always_enabled` — the app registers it
-/// unconditionally without listing it in "Available programs:".
-pub fn register() {
-    sicompass_sdk::register_provider_factory(
-        "filebrowser",
-        || Box::new(FilebrowserProvider::new()),
-    );
-    sicompass_sdk::register_builtin_manifest(
-        sicompass_sdk::BuiltinManifest::new("filebrowser", "file browser").always_enabled(),
-    );
 }
