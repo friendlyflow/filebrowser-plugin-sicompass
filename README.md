@@ -14,7 +14,8 @@ ctrl+z, a delete too, even after the trash was emptied.
 Sicompass uses the file browser to pick a place when you save or open a file
 (ctrl+s, ctrl+shift+s, ctrl+o), so install it before you do either.
 
-Colon commands: show or hide properties (size and date), show or hide hidden
+Colon commands: open file with (one of your installed applications), show or
+hide properties (permissions, owner, group, size and date, like `ls -l`), show or hide hidden
 files (names starting with a dot), and sort alphanumerically or
 chronologically. The sort order is also in Settings, under file browser.
 

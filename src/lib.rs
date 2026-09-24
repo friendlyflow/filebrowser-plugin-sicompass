@@ -18,17 +18,16 @@
 //! the app keeps on its timeline, so an undo writes it back even after the
 //! trash was emptied. Too large to snapshot, it asks `desktop.restore`.
 //!
-//! What the sandbox does not have: Unix permission bits and owner names (the
-//! properties view shows size and date there), and the list of the system's
-//! applications, so there is no "open file with" (the app opens a file with
-//! its default program itself).
+//! What WASI lacks comes from the host's `desktop` interface: permission bits,
+//! owner and group for the properties view (`stat`), and the user's installed
+//! applications for "open file with" (`applications`, `open-with`).
 
 mod desktop;
 pub mod localize;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use desktop::{Desktop, HostDesktop};
+use desktop::{Desktop, HostDesktop, Stat};
 use sicompass_pdk::{Descriptor, Plugin, ProviderOp, SearchResult, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::fs_snapshot;
@@ -68,7 +67,10 @@ pub struct FilebrowserProvider {
     /// Undoable deletes since the last drain, each carrying its snapshot.
     /// Create, rename and paste are recorded by the app itself.
     pending_timeline_entries: Vec<ProviderOp>,
-    /// The OS trash, through the host (a fake in the tests).
+    /// Stored between `handle_command("open file with")` and `execute_command`.
+    open_with_path: Option<PathBuf>,
+    /// The OS trash, stat and applications, through the host (a fake in the
+    /// tests).
     desktop: Box<dyn Desktop>,
     error: Option<String>,
 }
@@ -81,6 +83,7 @@ impl FilebrowserProvider {
             show_hidden: false,
             sort_mode: SortMode::Alpha,
             pending_timeline_entries: Vec::new(),
+            open_with_path: None,
             desktop,
             error: None,
         }
@@ -116,7 +119,11 @@ impl FilebrowserProvider {
             }
         }
         let path = &self.current_path;
-        let mut raw = collect_raw_entries(&self.desktop.resolve(path), &*self.desktop);
+        let mut raw = collect_raw_entries(
+            &self.desktop.resolve(path),
+            &*self.desktop,
+            self.show_properties,
+        );
 
         if !self.show_hidden {
             raw.retain(|e| !e.name.starts_with('.'));
@@ -357,6 +364,7 @@ impl Plugin for FilebrowserProvider {
         vec![
             "create directory".into(),
             "create file".into(),
+            "open file with".into(),
             "show/hide properties".into(),
             "show/hide hidden files".into(),
             "sort alphanumerically".into(),
@@ -367,8 +375,8 @@ impl Plugin for FilebrowserProvider {
     fn handle_command(
         &mut self,
         command: &str,
-        _element_key: &str,
-        _element_type: i32,
+        element_key: &str,
+        element_type: i32,
     ) -> Result<Option<FfonElement>, String> {
         Ok(match command {
             "create directory" => Some(new_obj_with_i_placeholder("<input></input>")),
@@ -389,8 +397,43 @@ impl Plugin for FilebrowserProvider {
                 self.sort_mode = SortMode::Chrono;
                 None
             }
+            "open file with" => {
+                // element_type 1 = FFON_OBJECT (directory)
+                if element_type == 1 {
+                    return Err(localize::t("filebrowser-error-open-with-not-file"));
+                }
+                let filename = entry_name(element_key);
+                if filename.is_empty() {
+                    return Err(localize::t("filebrowser-error-open-with-no-filename"));
+                }
+                self.open_with_path = Some(self.dir().join(&filename));
+                None
+            }
             _ => None,
         })
+    }
+
+    /// The user's installed applications, from the host. The data is the id
+    /// the host takes back in `open-with`, which accepts only these.
+    fn command_list_items(&self, command: &str) -> Vec<sicompass_pdk::ListItem> {
+        if command != "open file with" {
+            return Vec::new();
+        }
+        self.desktop
+            .applications()
+            .into_iter()
+            .map(|a| sicompass_pdk::ListItem {
+                label: a.name,
+                data: a.id,
+            })
+            .collect()
+    }
+
+    fn execute_command(&mut self, command: &str, selection: &str) -> bool {
+        match (command, &self.open_with_path) {
+            ("open file with", Some(path)) => self.desktop.open_with(selection, path).is_ok(),
+            _ => false,
+        }
     }
 
     fn collect_extended_search_items(&self) -> Option<Vec<SearchResult>> {
@@ -491,14 +534,8 @@ struct RawEntry {
     mtime: SystemTime,
     is_dir: bool,
     size: u64,
-    #[cfg(unix)]
-    mode: u32,
-    #[cfg(unix)]
-    nlink: u64,
-    #[cfg(unix)]
-    uid: u32,
-    #[cfg(unix)]
-    gid: u32,
+    /// Asked of the host only while properties are shown: one call per entry.
+    stat: Option<Stat>,
 }
 
 /// The on-disk name of an entry given its rendered label.
@@ -520,7 +557,7 @@ fn entry_name(label: &str) -> String {
 /// other programs change, `std::fs::read_dir` inside the sandbox stops at the
 /// first entry that vanished and loses every entry after it. An entry that
 /// vanishes between listing and reading its metadata is left out.
-fn collect_raw_entries(path: &Path, desktop: &dyn Desktop) -> Vec<RawEntry> {
+fn collect_raw_entries(path: &Path, desktop: &dyn Desktop, with_stat: bool) -> Vec<RawEntry> {
     let Ok(names) = sicompass_pdk::fs::list_dir(path) else {
         return Vec::new();
     };
@@ -551,166 +588,107 @@ fn collect_raw_entries(path: &Path, desktop: &dyn Desktop) -> Vec<RawEntry> {
             meta.is_dir()
         };
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            entries.push(RawEntry {
-                name,
-                mtime,
-                is_dir,
-                size: meta.size(),
-                mode: meta.mode(),
-                nlink: meta.nlink(),
-                uid: meta.uid(),
-                gid: meta.gid(),
-            });
-        }
-        #[cfg(not(unix))]
+        let stat = if with_stat {
+            desktop.stat(&entry_path)
+        } else {
+            None
+        };
         entries.push(RawEntry {
             name,
             mtime,
             is_dir,
             size: meta.len(),
+            stat,
         });
     }
     entries
 }
 
 // ---------------------------------------------------------------------------
-// Property formatting (Unix)
+// Property formatting, like `ls -l`
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-// The `libc::S_*` casts are no-ops on Linux but not on macOS, where the
-// constants are `u16`; one source for both.
-#[allow(clippy::unnecessary_cast)]
-fn format_properties(e: &RawEntry) -> String {
-    use libc::{getgrgid, getpwuid};
-    use std::ffi::CStr;
+/// The POSIX file-type bits of `st_mode`; the same numbers on every Unix.
+const S_IFMT: u32 = 0o170_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFLNK: u32 = 0o120_000;
 
-    // Permission string (e.g. "drwxr-xr-x"). The `libc::S_*` constants are
-    // `u16` on macOS but `u32` on Linux, so cast them to match `mode`.
-    let mode = e.mode;
-    let mut perm = [b'-'; 10];
-    perm[0] = if mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
-        b'd'
-    } else if mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32 {
-        b'l'
-    } else {
-        b'-'
+/// `drwxr-xr-x` for a mode.
+fn permission_string(mode: u32) -> String {
+    let kind = match mode & S_IFMT {
+        S_IFDIR => 'd',
+        S_IFLNK => 'l',
+        _ => '-',
     };
-    perm[1] = if mode & libc::S_IRUSR as u32 != 0 {
-        b'r'
-    } else {
-        b'-'
-    };
-    perm[2] = if mode & libc::S_IWUSR as u32 != 0 {
-        b'w'
-    } else {
-        b'-'
-    };
-    perm[3] = if mode & libc::S_IXUSR as u32 != 0 {
-        b'x'
-    } else {
-        b'-'
-    };
-    perm[4] = if mode & libc::S_IRGRP as u32 != 0 {
-        b'r'
-    } else {
-        b'-'
-    };
-    perm[5] = if mode & libc::S_IWGRP as u32 != 0 {
-        b'w'
-    } else {
-        b'-'
-    };
-    perm[6] = if mode & libc::S_IXGRP as u32 != 0 {
-        b'x'
-    } else {
-        b'-'
-    };
-    perm[7] = if mode & libc::S_IROTH as u32 != 0 {
-        b'r'
-    } else {
-        b'-'
-    };
-    perm[8] = if mode & libc::S_IWOTH as u32 != 0 {
-        b'w'
-    } else {
-        b'-'
-    };
-    perm[9] = if mode & libc::S_IXOTH as u32 != 0 {
-        b'x'
-    } else {
-        b'-'
-    };
-    let perm_str = std::str::from_utf8(&perm).unwrap_or("----------");
-
-    // Owner and group names (fall back to numeric ids)
-    let owner = unsafe {
-        let pw = getpwuid(e.uid);
-        if !pw.is_null() {
-            CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
-        } else {
-            e.uid.to_string()
-        }
-    };
-    let group = unsafe {
-        let gr = getgrgid(e.gid);
-        if !gr.is_null() {
-            CStr::from_ptr((*gr).gr_name).to_string_lossy().into_owned()
-        } else {
-            e.gid.to_string()
-        }
-    };
-
-    // Date formatted like ls -l: "Mon DD HH:MM" (recent) or "Mon DD  YYYY" (older)
-    let mtime_secs = e
-        .mtime
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as libc::time_t;
-    let date_str = unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&mtime_secs, &mut tm);
-        let fmt = if now - mtime_secs < 6 * 30 * 24 * 3600 {
-            c"%b %e %H:%M".as_ptr()
-        } else {
-            c"%b %e  %Y".as_ptr()
-        };
-        let mut buf = [0i8; 16];
-        libc::strftime(buf.as_mut_ptr(), buf.len(), fmt, &tm);
-        CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
-    };
-
-    format!(
-        "{} {:2} {:<8} {:<8} {:5} {} ",
-        perm_str, e.nlink, owner, group, e.size, date_str
-    )
+    let bits = [
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
+    ];
+    std::iter::once(kind)
+        .chain(
+            bits.iter()
+                .map(|&(b, c)| if mode & b != 0 { c } else { '-' }),
+        )
+        .collect()
 }
 
-#[cfg(not(unix))]
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The date as `ls -l` prints it, in local time: `May 31 12:00` for the last
+/// six months, `May 31  2025` before that (or in the future).
+fn ls_date(mtime: i64, utc_offset: i32, now: i64) -> String {
+    let local = mtime + i64::from(utc_offset);
+    let (y, m, d) = civil_from_days(local.div_euclid(86_400));
+    let month = MONTHS[(m - 1) as usize];
+    let recent = (0..6 * 30 * 86_400).contains(&(now - mtime));
+    if recent {
+        let secs = local.rem_euclid(86_400);
+        format!("{month} {d:>2} {:02}:{:02}", secs / 3600, secs % 3600 / 60)
+    } else {
+        format!("{month} {d:>2}  {y}")
+    }
+}
+
+/// The properties prefix of a row: the whole `ls -l` line where the host
+/// could say who owns it and how, size and date otherwise.
 fn format_properties(e: &RawEntry) -> String {
-    let secs = e
-        .mtime
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86400) as i64;
-    let (y, mo, d) = civil_from_days(days);
-    let h = (secs % 86400) / 3600;
-    let mi = (secs % 3600) / 60;
-    format!(
-        "{:>9} {:04}-{:02}-{:02} {:02}:{:02} ",
-        e.size, y, mo, d, h, mi
-    )
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    };
+    let now = secs(SystemTime::now());
+    let offset = e.stat.as_ref().map_or(0, |s| s.utc_offset);
+    let date = ls_date(secs(e.mtime), offset, now);
+    match &e.stat {
+        Some(Stat {
+            mode: Some(mode),
+            links,
+            owner,
+            group,
+            ..
+        }) => format!(
+            "{} {:2} {:<8} {:<8} {:5} {date} ",
+            permission_string(*mode),
+            links.unwrap_or(1),
+            owner.as_deref().unwrap_or("?"),
+            group.as_deref().unwrap_or("?"),
+            e.size,
+        ),
+        _ => format!("{:>9} {date} ", e.size),
+    }
 }
 
 // Howard Hinnant's civil_from_days: converts days-since-1970-01-01 to (year,
-// month, day) in the proleptic Gregorian calendar. Used for UTC date display
-// on Windows where libc::localtime_r is unavailable.
-#[cfg(not(unix))]
+// month, day) in the proleptic Gregorian calendar.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -792,6 +770,7 @@ fn list_drives() -> Vec<FfonElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop::App;
     use sicompass_sdk::fs_snapshot::TRASH_SNAPSHOT_LIMIT_BYTES;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -811,6 +790,8 @@ mod tests {
         restores: Vec<PathBuf>,
         /// Answer restores with this refusal, as macOS's trash does.
         refuse_restore: Option<String>,
+        apps: Vec<App>,
+        opened: Vec<(String, PathBuf)>,
     }
 
     impl Desktop for FakeDesktop {
@@ -841,6 +822,19 @@ mod tests {
                 .ok_or("no matching item in the trash")?;
             let (orig, kept) = t.items.remove(at);
             std::fs::rename(kept, orig).map_err(|e| e.to_string())
+        }
+
+        fn applications(&self) -> Vec<App> {
+            self.0.borrow().apps.clone()
+        }
+
+        fn open_with(&self, id: &str, path: &Path) -> Result<(), String> {
+            let mut t = self.0.borrow_mut();
+            if !t.apps.iter().any(|a| a.id == id) {
+                return Err("not an installed application".into());
+            }
+            t.opened.push((id.to_owned(), path.to_path_buf()));
+            Ok(())
         }
     }
 
@@ -1542,14 +1536,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_commands_returns_six() {
+    fn test_get_commands_returns_seven() {
         let p = fb();
         let cmds = p.commands();
-        assert_eq!(cmds.len(), 6);
+        assert_eq!(cmds.len(), 7);
         assert!(cmds.contains(&"create directory".to_string()));
         assert!(cmds.contains(&"create file".to_string()));
-        // Not in the sandbox: it cannot list the system's applications.
-        assert!(!cmds.contains(&"open file with".to_string()));
+        assert!(cmds.contains(&"open file with".to_string()));
         assert!(cmds.contains(&"show/hide properties".to_string()));
         assert!(cmds.contains(&"show/hide hidden files".to_string()));
         assert!(cmds.contains(&"sort alphanumerically".to_string()));
@@ -1800,30 +1793,110 @@ mod tests {
 
     // ---- property formatting ----------------------------------------------
 
-    #[cfg(unix)]
     #[test]
-    // The same macOS `u16` casts as in `format_properties`.
-    #[allow(clippy::unnecessary_cast)]
     fn test_format_properties_permission_string() {
         let mk = |mode: u32| RawEntry {
             name: "x".into(),
             mtime: SystemTime::UNIX_EPOCH,
             is_dir: false,
             size: 0,
-            mode,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
+            stat: Some(Stat {
+                mode: Some(mode),
+                links: Some(1),
+                owner: Some("nico".into()),
+                group: Some("users".into()),
+                utc_offset: 0,
+            }),
         };
-        // Casting the `libc::S_*` constants to `u32` must keep the bit tests
-        // correct (they are `u16` on macOS, `u32` on Linux).
-        let dir = format_properties(&mk(libc::S_IFDIR as u32 | 0o755));
+        let dir = format_properties(&mk(0o040_755));
         assert!(dir.starts_with("drwxr-xr-x "), "got: {dir}");
+        assert!(
+            dir.contains(" nico ") && dir.contains(" users "),
+            "got: {dir}"
+        );
 
-        let file = format_properties(&mk(libc::S_IFREG as u32 | 0o644));
+        let file = format_properties(&mk(0o100_644));
         assert!(file.starts_with("-rw-r--r-- "), "got: {file}");
 
-        let link = format_properties(&mk(libc::S_IFLNK as u32 | 0o777));
+        let link = format_properties(&mk(0o120_777));
         assert!(link.starts_with("lrwxrwxrwx "), "got: {link}");
+
+        // Where the host has no mode (Windows): size and date only.
+        let bare = format_properties(&RawEntry {
+            stat: None,
+            ..mk(0)
+        });
+        assert!(
+            bare.trim_start().starts_with('0') && !bare.contains("rw"),
+            "got: {bare}"
+        );
+    }
+
+    /// `ls -l`'s two date forms, in local time from the host's UTC offset.
+    #[test]
+    fn dates_read_like_ls_in_local_time() {
+        let may_31_noon_utc = 1_748_692_800; // 2025-05-31 12:00:00 UTC
+        let now = may_31_noon_utc + 86_400;
+        assert_eq!(ls_date(may_31_noon_utc, 0, now), "May 31 12:00");
+        assert_eq!(ls_date(may_31_noon_utc, 7200, now), "May 31 14:00");
+        assert_eq!(ls_date(may_31_noon_utc, -13 * 3600, now), "May 30 23:00");
+        let a_year_later = may_31_noon_utc + 365 * 86_400;
+        assert_eq!(ls_date(may_31_noon_utc, 0, a_year_later), "May 31  2025");
+        assert_eq!(ls_date(1_738_368_000, 0, now), "Feb  1 00:00", "day padded");
+    }
+
+    #[test]
+    fn test_handle_command_open_with_directory_error() {
+        let (mut p, _dir) = make_provider();
+        // element_type 1 = FFON_OBJECT (directory)
+        let err = p
+            .handle_command("open file with", "<input>somedir</input>", 1)
+            .unwrap_err();
+        assert!(
+            err.contains("directory"),
+            "error should mention directory: {err}"
+        );
+    }
+
+    /// The applications are the host's, and the choice goes back to it with
+    /// the file the command was started on.
+    #[test]
+    fn open_file_with_lists_the_hosts_applications_and_opens_with_one() {
+        let desktop = FakeDesktop::default();
+        desktop.0.borrow_mut().apps = vec![App {
+            name: "Text Editor".into(),
+            id: "gedit".into(),
+        }];
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("test.txt"), b"content").unwrap();
+        let mut p = fb_on(&desktop);
+        p.set_current_path(dir.path().to_str().unwrap());
+
+        p.handle_command("open file with", "<input>test.txt</input>", 0)
+            .unwrap();
+        let items = p.command_list_items("open file with");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            (items[0].label.as_str(), items[0].data.as_str()),
+            ("Text Editor", "gedit")
+        );
+        assert!(p.execute_command("open file with", "gedit"));
+        assert_eq!(
+            desktop.0.borrow().opened,
+            vec![(
+                "gedit".to_owned(),
+                dir.path().canonicalize().unwrap().join("test.txt")
+            )]
+        );
+    }
+
+    #[test]
+    fn test_execute_command_open_with_no_path_returns_false() {
+        // Without first calling handle_command to set the path, execute should return false.
+        let (mut p, _dir) = make_provider();
+        assert!(
+            !p.execute_command("open file with", "firefox"),
+            "execute_command should return false when no path is set"
+        );
     }
 }

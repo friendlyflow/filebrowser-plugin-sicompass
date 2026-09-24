@@ -34,9 +34,11 @@ releases. The plugin platform is described in
   payload, base64-encoded. Undo writes the snapshot back, or asks
   `desktop.restore` when it was too large to keep. Renames, creates and pastes
   are recorded by the app itself.
-- **Not available:** Unix permission bits and owner names (the properties view
-  shows size and date inside the sandbox, the full `ls -l` form in native test
-  builds), and the system's application list, so there is no "open file with".
+- **Properties and "open file with"** come from the host: `desktop.stat`
+  (permission bits, links, owner, group, the local UTC offset) and
+  `desktop.applications` / `desktop.open-with` (only ids the host listed).
+  `format_properties` builds the `ls -l` line itself, so it reads the same
+  inside the sandbox and in native tests.
 - `Desktop` is a trait so the tests run natively: the fake trash moves items
   into a temp folder and back. No test may reach the developer's real trash.
 
