@@ -1,4 +1,4 @@
-# filebrowser_plugin_sicompass
+# filebrowser-plugin-sicompass
 
 *Your files, in Sicompass.*
 

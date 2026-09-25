@@ -1,6 +1,6 @@
 # Project Instructions
 
-filebrowser_plugin_sicompass was split out of the
+filebrowser-plugin-sicompass was split out of the
 [sicompass](https://github.com/friendlyflow/sicompass) workspace, and its git
 history before that point is the history of `lib/lib_filebrowser` there. Work on it is
 usually driven from a sicompass checkout next to this one (`../sicompass`),
