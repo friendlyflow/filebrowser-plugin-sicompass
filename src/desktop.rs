@@ -1,16 +1,19 @@
-//! What the file browser needs from outside the sandbox, through the host's
-//! `desktop` interface: the OS trash, symlink targets, `ls -l` details, and the
-//! user's applications.
+//! What the file browser needs from the desktop: the OS trash and the user's
+//! applications, which are the app's (`sicompass_sdk::plugin::desktop`), and
+//! symlink targets and `ls -l` details, which it reads itself.
 //!
-//! A trait so the tests run natively. There the defaults ask the OS directly,
-//! and the tests' fake trash moves items into a temp folder, because a test
-//! must never put a fixture in the developer's real trash (about a thousand
-//! runs once left 37 850 of them there). Inside the sandbox it is the host,
-//! which only reaches paths this plugin was granted.
+//! The trash goes through the app, not a crate of the plugin's own, so a
+//! delete and its undo are the app's like every other program's.
+//!
+//! A trait so the tests can swap the trash: their fake moves items into a temp
+//! folder, because a test must never put a fixture in the developer's real
+//! trash (about a thousand runs once left 37 850 of them there). Outside
+//! sicompass, [`HostDesktop`] has no app to ask, and refuses.
 
 use std::path::{Path, PathBuf};
 
-/// What `ls -l` shows beyond size and date, which WASI's metadata lacks.
+/// What `ls -l` shows beyond size and date, which `std::fs::Metadata` does not
+/// carry portably.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stat {
     /// Type and permission bits (`st_mode`).
@@ -35,8 +38,7 @@ pub trait Desktop {
     /// Restore the most recently trashed item that was at `path`.
     fn restore(&self, path: &Path) -> Result<(), String>;
 
-    /// The target of the symlink at `path`. The sandbox never reads an
-    /// absolute one itself, so this asks the host.
+    /// The target of the symlink at `path`.
     fn read_link(&self, path: &Path) -> Option<PathBuf> {
         std::fs::read_link(path).ok()
     }
@@ -58,42 +60,24 @@ pub trait Desktop {
 
     /// Open `path` with application `id` from [`Desktop::applications`].
     fn open_with(&self, _id: &str, _path: &Path) -> Result<(), String> {
-        Err("no applications outside the sandbox".to_owned())
+        Err("no applications to open with".to_owned())
     }
 }
 
-/// The host's `desktop` interface.
+/// The app's `desktop` services, for what the plugin cannot do on its own.
 pub struct HostDesktop;
 
-#[cfg(target_arch = "wasm32")]
 impl Desktop for HostDesktop {
     fn trash(&self, path: &Path) -> Result<(), String> {
-        sicompass_pdk::desktop::trash(&path.to_string_lossy())
+        sicompass_sdk::plugin::desktop::trash(&path.to_string_lossy())
     }
 
     fn restore(&self, path: &Path) -> Result<(), String> {
-        sicompass_pdk::desktop::restore(&path.to_string_lossy())
-    }
-
-    fn read_link(&self, path: &Path) -> Option<PathBuf> {
-        sicompass_pdk::desktop::read_link(&path.to_string_lossy())
-            .ok()
-            .map(PathBuf::from)
-    }
-
-    fn stat(&self, path: &Path) -> Option<Stat> {
-        let f = sicompass_pdk::desktop::stat(&path.to_string_lossy()).ok()?;
-        Some(Stat {
-            mode: f.mode,
-            links: f.links,
-            owner: f.owner,
-            group: f.group,
-            utc_offset: f.utc_offset,
-        })
+        sicompass_sdk::plugin::desktop::restore(&path.to_string_lossy())
     }
 
     fn applications(&self) -> Vec<App> {
-        sicompass_pdk::desktop::applications()
+        sicompass_sdk::plugin::desktop::applications()
             .into_iter()
             .map(|a| App {
                 name: a.name,
@@ -103,27 +87,16 @@ impl Desktop for HostDesktop {
     }
 
     fn open_with(&self, id: &str, path: &Path) -> Result<(), String> {
-        sicompass_pdk::desktop::open_with(id, &path.to_string_lossy())
+        sicompass_sdk::plugin::desktop::open_with(id, &path.to_string_lossy())
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Desktop for HostDesktop {
-    fn trash(&self, _path: &Path) -> Result<(), String> {
-        Err("no OS trash outside the sandbox".to_owned())
-    }
-
-    fn restore(&self, _path: &Path) -> Result<(), String> {
-        Err("no OS trash outside the sandbox".to_owned())
-    }
-}
-
-/// The defaults: the OS itself, for native test builds.
+/// The defaults: the OS itself.
 mod native {
     use super::Stat;
     use std::path::Path;
 
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[cfg(unix)]
     pub fn stat(path: &Path) -> Option<Stat> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(path).ok()?;
@@ -136,12 +109,12 @@ mod native {
         })
     }
 
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(not(unix))]
     pub fn stat(_path: &Path) -> Option<Stat> {
         None
     }
 
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[cfg(unix)]
     fn utc_offset_at(secs: i64) -> i32 {
         let t = secs as libc::time_t;
         // SAFETY: `localtime_r` writes only into `tm`, which lives on this frame.
@@ -152,7 +125,7 @@ mod native {
         tm.tm_gmtoff as i32
     }
 
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[cfg(unix)]
     fn user_name(uid: u32) -> String {
         let mut buf = vec![0 as libc::c_char; 4096];
         // SAFETY: `pwd` and `buf` outlive the call, and `buf.len()` is its
@@ -171,7 +144,7 @@ mod native {
         uid.to_string()
     }
 
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[cfg(unix)]
     fn group_name(gid: u32) -> String {
         let mut buf = vec![0 as libc::c_char; 4096];
         // SAFETY: as in `user_name`.

@@ -1,8 +1,8 @@
 //! The file browser: the filesystem as a list of lists.
 //!
-//! A sicompass WASM plugin. It asks for the whole disk (`"filesystem": ["/"]`
-//! in `plugin.json`, shown at install), so the sandbox preopens `/` at its real
-//! path and `std::fs` works as it always did:
+//! A sicompass plugin: a program sicompass starts, with the user's rights. It
+//! declares the whole disk (`"filesystem": ["/"]` in `plugin.json`, shown at
+//! install), and reads and writes it with `std::fs`:
 //!
 //! - Root is `/`.
 //! - Each directory entry is wrapped in `<input>name</input>` so the user can
@@ -10,17 +10,18 @@
 //! - Commands: create directory, create file, show/hide properties, show/hide
 //!   hidden files, sort alphanumerically or chronologically.
 //! - `commit_edit(old, new)` renames, `delete_item` moves to the OS trash
-//!   through the host (`desktop.trash`), `copy_item` copies recursively.
-//! - Extended search is a BFS walk (up to 50 000 results).
+//!   through the app (`desktop::trash`), `copy_item` copies recursively.
+//! - Extended search is a BFS walk (up to 50 000 results, or 5 seconds).
 //!
 //! A delete is undoable: the item is snapshotted first
 //! (`sicompass_sdk::fs_snapshot`) and the snapshot rides in the `ProviderOp`
 //! the app keeps on its timeline, so an undo writes it back even after the
-//! trash was emptied. Too large to snapshot, it asks `desktop.restore`.
+//! trash was emptied. Too large to snapshot, it asks the app's
+//! `desktop::restore`.
 //!
-//! What WASI lacks comes from the host's `desktop` interface: permission bits,
-//! owner and group for the properties view (`stat`), and the user's installed
-//! applications for "open file with" (`applications`, `open-with`).
+//! The properties view reads permission bits, owner and group itself (`ls -l`,
+//! on Unix). The user's installed applications for "open file with" are the
+//! app's (`desktop::applications`, `desktop::open_with`).
 
 mod desktop;
 pub mod localize;
@@ -28,14 +29,16 @@ pub mod localize;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use desktop::{Desktop, HostDesktop, Stat};
-use sicompass_pdk::{Descriptor, Plugin, ProviderOp, SearchResult, export_plugin};
 use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::fs_snapshot;
 use sicompass_sdk::placeholders::new_obj_with_i_placeholder;
+use sicompass_sdk::plugin::{
+    Descriptor, ListItem, Plugin, PollResult, ProviderOp, SearchResult, host,
+};
 use sicompass_sdk::tags;
 use sicompass_sdk::timeline::FsSideEffect;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// The `ProviderOp` command of an undoable delete.
 const OP_DELETE: &str = "delete";
@@ -69,8 +72,8 @@ pub struct FilebrowserProvider {
     pending_timeline_entries: Vec<ProviderOp>,
     /// Stored between `handle_command("open file with")` and `execute_command`.
     open_with_path: Option<PathBuf>,
-    /// The OS trash, stat and applications, through the host (a fake in the
-    /// tests).
+    /// The OS trash and the applications, through the app (a fake trash in
+    /// the tests), and stat and symlinks from the OS.
     desktop: Box<dyn Desktop>,
     error: Option<String>,
 }
@@ -89,8 +92,9 @@ impl FilebrowserProvider {
         }
     }
 
-    /// The folder on screen, through any symlinks along its path, as the
-    /// sandbox needs it (see `sicompass_sdk::fs_links`).
+    /// The folder on screen, through any symlinks along its path (see
+    /// `sicompass_sdk::fs_links`), while navigation keeps the path the user
+    /// took.
     fn dir(&self) -> PathBuf {
         self.desktop.resolve(&self.current_path)
     }
@@ -179,13 +183,13 @@ impl Plugin for FilebrowserProvider {
 
     fn init(&mut self) {
         self.current_path = PathBuf::from("/");
-        if let Some(v) = sicompass_pdk::host::get_setting("sortOrder") {
+        if let Some(v) = host::get_setting("sortOrder") {
             self.on_setting_change("sortOrder", &v);
         }
     }
 
-    fn poll(&mut self) -> sicompass_pdk::PollResult {
-        sicompass_pdk::PollResult {
+    fn poll(&mut self) -> PollResult {
+        PollResult {
             at_root: self.current_path == Path::new("/"),
             error: self.take_error(),
             structural_edit_here: true,
@@ -413,16 +417,16 @@ impl Plugin for FilebrowserProvider {
         })
     }
 
-    /// The user's installed applications, from the host. The data is the id
-    /// the host takes back in `open-with`, which accepts only these.
-    fn command_list_items(&self, command: &str) -> Vec<sicompass_pdk::ListItem> {
+    /// The user's installed applications, from the app. The data is the id
+    /// the app takes back in `open_with`, which accepts only these.
+    fn command_list_items(&self, command: &str) -> Vec<ListItem> {
         if command != "open file with" {
             return Vec::new();
         }
         self.desktop
             .applications()
             .into_iter()
-            .map(|a| sicompass_pdk::ListItem {
+            .map(|a| ListItem {
                 label: a.name,
                 data: a.id,
             })
@@ -441,13 +445,11 @@ impl Plugin for FilebrowserProvider {
     }
 }
 
-export_plugin!(FilebrowserProvider);
-
 /// A delete's snapshot, as a `ProviderOp` payload: FFON text, so the bytes
 /// travel base64-encoded.
 fn encode_side_effect(side_effect: &FsSideEffect) -> Vec<u8> {
     let text = B64.encode(fs_snapshot::encode(side_effect));
-    sicompass_pdk::encode_one(&FfonElement::Str(text))
+    sicompass_sdk::plugin::encode_one(&FfonElement::Str(text))
 }
 
 /// The inverse; `None` for an entry that is not one of this plugin's deletes.
@@ -455,7 +457,7 @@ fn decode_side_effect(entry: &ProviderOp) -> Option<FsSideEffect> {
     if entry.command != OP_DELETE {
         return None;
     }
-    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let payload = sicompass_sdk::plugin::decode_one(&entry.payload)?;
     let bytes = B64.decode(payload.as_str()?).ok()?;
     fs_snapshot::decode(&bytes)
 }
@@ -463,6 +465,10 @@ fn decode_side_effect(entry: &ProviderOp) -> Option<FsSideEffect> {
 impl FilebrowserProvider {
     fn run_extended_search(&self) -> Vec<SearchResult> {
         const MAX_ITEMS: usize = 50_000;
+        // The app gives a call 10 seconds and then ends the plugin. A walk of
+        // a slow disk or a network mount stops here with what it found.
+        const BUDGET: Duration = Duration::from_secs(5);
+        let deadline = Instant::now() + BUDGET;
         let mut results = Vec::new();
         let root = self.dir();
 
@@ -472,11 +478,11 @@ impl FilebrowserProvider {
         queue.push_back((root, String::new()));
 
         while let Some((dir, breadcrumb)) = queue.pop_front() {
-            if results.len() >= MAX_ITEMS {
+            if results.len() >= MAX_ITEMS || Instant::now() >= deadline {
                 break;
             }
 
-            let Ok(names) = sicompass_pdk::fs::list_dir(&dir) else {
+            let Ok(names) = list_dir(&dir) else {
                 continue;
             };
 
@@ -534,7 +540,7 @@ struct RawEntry {
     mtime: SystemTime,
     is_dir: bool,
     size: u64,
-    /// Asked of the host only while properties are shown: one call per entry.
+    /// Read only while properties are shown.
     stat: Option<Stat>,
 }
 
@@ -553,12 +559,18 @@ fn entry_name(label: &str) -> String {
     }
 }
 
-/// The entries of `path`, through `sicompass_pdk::fs::list_dir`: in a folder
-/// other programs change, `std::fs::read_dir` inside the sandbox stops at the
-/// first entry that vanished and loses every entry after it. An entry that
-/// vanishes between listing and reading its metadata is left out.
+/// The names in `dir`, skipping any entry that cannot be read.
+fn list_dir(dir: &Path) -> std::io::Result<Vec<String>> {
+    Ok(std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect())
+}
+
+/// The entries of `path`. An entry that vanishes between listing and reading
+/// its metadata is left out.
 fn collect_raw_entries(path: &Path, desktop: &dyn Desktop, with_stat: bool) -> Vec<RawEntry> {
-    let Ok(names) = sicompass_pdk::fs::list_dir(path) else {
+    let Ok(names) = list_dir(path) else {
         return Vec::new();
     };
 
@@ -658,8 +670,8 @@ fn ls_date(mtime: i64, utc_offset: i32, now: i64) -> String {
     }
 }
 
-/// The properties prefix of a row: the whole `ls -l` line where the host
-/// could say who owns it and how, size and date otherwise.
+/// The properties prefix of a row: the whole `ls -l` line where the OS says
+/// who owns it and how (Unix), size and date otherwise.
 fn format_properties(e: &RawEntry) -> String {
     let secs = |t: SystemTime| {
         t.duration_since(SystemTime::UNIX_EPOCH)
@@ -854,11 +866,11 @@ mod tests {
         (p, dir)
     }
 
-    /// Outside the sandbox there is no trash at all: the plugin's own host
-    /// desktop refuses rather than deleting anything, so a native test can only
+    /// Outside sicompass there is no app to trash anything: the plugin's own
+    /// host desktop refuses rather than deleting anything, so a test can only
     /// ever reach the fake.
     #[test]
-    fn natively_the_host_desktop_touches_nothing() {
+    fn outside_sicompass_the_host_desktop_touches_nothing() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("x.txt");
         std::fs::write(&file, b"x").unwrap();
@@ -1263,9 +1275,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    /// Through a symlink with an absolute target, which the sandbox does not
-    /// follow on its own: still a folder, and its contents still list.
+    /// Through a symlink with an absolute target: still a folder, and its
+    /// contents still list.
     #[cfg(unix)]
     #[test]
     fn a_folder_reached_through_an_absolute_link_lists_its_contents() {
@@ -1290,6 +1301,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_broken_symlink_is_not_a_directory() {
         let (mut p, dir) = make_provider();
@@ -1784,7 +1796,7 @@ mod tests {
         let mut p = fb();
         let other = ProviderOp {
             command: "something-else".to_owned(),
-            payload: sicompass_pdk::encode_one(&FfonElement::Str("x".into())),
+            payload: sicompass_sdk::plugin::encode_one(&FfonElement::Str("x".into())),
             label: "x".to_owned(),
         };
         assert!(p.undo(&other).is_ok());
@@ -1821,7 +1833,7 @@ mod tests {
         let link = format_properties(&mk(0o120_777));
         assert!(link.starts_with("lrwxrwxrwx "), "got: {link}");
 
-        // Where the host has no mode (Windows): size and date only.
+        // Where the OS gives no mode (Windows): size and date only.
         let bare = format_properties(&RawEntry {
             stat: None,
             ..mk(0)
@@ -1832,7 +1844,7 @@ mod tests {
         );
     }
 
-    /// `ls -l`'s two date forms, in local time from the host's UTC offset.
+    /// `ls -l`'s two date forms, in local time at the file's own UTC offset.
     #[test]
     fn dates_read_like_ls_in_local_time() {
         let may_31_noon_utc = 1_748_692_800; // 2025-05-31 12:00:00 UTC
@@ -1858,7 +1870,7 @@ mod tests {
         );
     }
 
-    /// The applications are the host's, and the choice goes back to it with
+    /// The applications are the app's, and the choice goes back to it with
     /// the file the command was started on.
     #[test]
     fn open_file_with_lists_the_hosts_applications_and_opens_with_one() {

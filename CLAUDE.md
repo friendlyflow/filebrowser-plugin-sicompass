@@ -8,45 +8,53 @@ whose `/commit-and-push`, `/release`, `/sync` and `/update-cargo` take this
 repo's name as their first argument and then follow the skills in this repo's
 `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` is `filebrowser` (the renderer's
   save-as and open dialogs look it up by that name, so it must not change) and
   its `displayName` `file browser` is the settings section (`sortOrder`). It
-  asks for `"filesystem": ["/"]`, the whole disk, which the user approves at
+  declares `"filesystem": ["/"]`, the whole disk, which the user approves at
   install.
 - `locales/<lang>.ftl`, every id prefixed `filebrowser-`, in all four
   languages.
 
-## The sandbox, and what it changes
+## What it does itself, and what it asks the app
 
-- **Symlinks.** WASI never follows (or reads) a symlink with an absolute
-  target. Every filesystem call goes through `Desktop::resolve`
-  (`sicompass_sdk::fs_links`), which reads links through the host's
-  `desktop.read-link`. Navigation keeps the path the user took.
-- **Listings.** `std::fs::read_dir` stops at the first entry another program
-  removed meanwhile and loses the rest. List with `sicompass_pdk::fs::list_dir`.
-- **Deletes** go to the OS trash through the host (`desktop.trash`), after a
-  snapshot (`sicompass_sdk::fs_snapshot`) that rides in the `ProviderOp` undo
-  payload, base64-encoded. Undo writes the snapshot back, or asks
-  `desktop.restore` when it was too large to keep. Renames, creates and pastes
+- **The filesystem** is plain `std::fs`. Listings skip an entry that cannot be
+  read rather than failing the folder.
+- **Symlinks.** Every filesystem call goes through `Desktop::resolve`
+  (`sicompass_sdk::fs_links`), so navigation keeps the path the user took
+  while the calls see the real folder.
+- **Deletes** go to the OS trash through the app
+  (`sicompass_sdk::plugin::desktop::trash`), after a snapshot
+  (`sicompass_sdk::fs_snapshot`) that rides in the `ProviderOp` undo payload,
+  base64-encoded. Undo writes the snapshot back, or asks the app's
+  `desktop::restore` when it was too large to keep. Renames, creates and pastes
   are recorded by the app itself.
-- **Properties and "open file with"** come from the host: `desktop.stat`
-  (permission bits, links, owner, group, the local UTC offset) and
-  `desktop.applications` / `desktop.open-with` (only ids the host listed).
-  `format_properties` builds the `ls -l` line itself, so it reads the same
-  inside the sandbox and in native tests.
-- `Desktop` is a trait so the tests run natively: the fake trash moves items
+- **Properties** are read from the OS: permission bits, links, owner and group
+  (`getpwuid_r`/`getgrgid_r`, the number when there is no name) and the local
+  UTC offset, on Unix. On Windows a row shows size and date only.
+  `format_properties` builds the `ls -l` line itself.
+- **"Open file with"** is the app's: `desktop::applications` and
+  `desktop::open_with` (only ids the app listed).
+- **Every call has 10 seconds**, after which the app ends the plugin. The
+  extended search stops after 5 seconds with what it found.
+- `Desktop` is a trait so the tests can swap the trash: the fake moves items
   into a temp folder and back. No test may reach the developer's real trash.
+  Outside sicompass, `HostDesktop` has no app to ask and refuses.
+- Strings come from the app (`host::translate`), which holds this plugin's
+  `locales/`. The unit tests read `locales/en-US.ftl` instead.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -74,8 +82,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -98,6 +106,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/filebrowser.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.
