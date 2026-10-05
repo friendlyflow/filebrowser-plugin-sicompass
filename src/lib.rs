@@ -465,8 +465,8 @@ fn decode_side_effect(entry: &ProviderOp) -> Option<FsSideEffect> {
 impl FilebrowserProvider {
     fn run_extended_search(&self) -> Vec<SearchResult> {
         const MAX_ITEMS: usize = 50_000;
-        // The app gives a call 10 seconds and then ends the plugin. A walk of
-        // a slow disk or a network mount stops here with what it found.
+        // The app waits for this call, drawing nothing meanwhile. A walk of a
+        // slow disk or a network mount stops here with what it found.
         const BUDGET: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + BUDGET;
         let mut results = Vec::new();

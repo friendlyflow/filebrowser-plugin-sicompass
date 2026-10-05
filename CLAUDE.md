@@ -41,7 +41,7 @@ GitHub releases, one build per platform. The plugin platform is described in
   `format_properties` builds the `ls -l` line itself.
 - **"Open file with"** is the app's: `desktop::applications` and
   `desktop::open_with` (only ids the app listed).
-- **Every call has 10 seconds**, after which the app ends the plugin. The
+- **The app waits for every call to answer**, drawing nothing meanwhile. The
   extended search stops after 5 seconds with what it found.
 - `Desktop` is a trait so the tests can swap the trash: the fake moves items
   into a temp folder and back. No test may reach the developer's real trash.
