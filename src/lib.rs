@@ -274,9 +274,19 @@ impl Plugin for FilebrowserProvider {
         // The folder through any symlinks, the entries themselves as they are:
         // renaming a link renames the link.
         let dir = self.dir();
-        let old_path = dir.join(old_name.trim_end_matches('/').trim_end_matches('\\'));
-        let new_path = dir.join(new_name.trim_end_matches('/').trim_end_matches('\\'));
-        std::fs::rename(&old_path, &new_path).is_ok()
+        let old_name = old_name.trim_end_matches('/').trim_end_matches('\\');
+        let new_name = new_name.trim_end_matches('/').trim_end_matches('\\');
+        match std::fs::rename(dir.join(old_name), dir.join(new_name)) {
+            Ok(()) => true,
+            Err(e) => {
+                let mut args = localize::Args::new();
+                args.set("old", old_name);
+                args.set("new", new_name);
+                args.set("err", io_reason(&e));
+                self.error = Some(localize::t_args("filebrowser-error-rename", &args));
+                false
+            }
+        }
     }
 
     fn delete_item(&mut self, name: &str) -> bool {
@@ -290,7 +300,8 @@ impl Plugin for FilebrowserProvider {
         // Snapshot the target before deletion so an undo can restore even if
         // the OS trash has been emptied (see `sicompass_sdk::fs_snapshot`).
         let side_effect = fs_snapshot::snapshot_for_delete(&full);
-        if self.desktop.trash(&full).is_err() {
+        if let Err(e) = self.desktop.trash(&full) {
+            self.error = Some(failed("filebrowser-error-delete", &name_clean, &reason(&e)));
             return false;
         }
         self.pending_timeline_entries.push(ProviderOp {
@@ -299,6 +310,21 @@ impl Plugin for FilebrowserProvider {
             label: format!("delete {name_clean}"),
         });
         true
+    }
+
+    /// A folder the user may not write to (one that needs sudo) says so
+    /// before a name is typed, in the words a create there would get.
+    fn cannot_add_here(&mut self) -> Option<String> {
+        #[cfg(windows)]
+        if self.current_path == Path::new("/") {
+            return None; // the drive list
+        }
+        let dir = self.dir();
+        let err = may_create_in(&dir).err()?;
+        let mut args = localize::Args::new();
+        args.set("dir", dir.display());
+        args.set("err", io_reason(&err));
+        Some(localize::t_args("filebrowser-error-add-here", &args))
     }
 
     fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
@@ -335,7 +361,17 @@ impl Plugin for FilebrowserProvider {
             return false;
         }
         let full = self.dir().join(name);
-        std::fs::create_dir(&full).is_ok()
+        match std::fs::create_dir(&full) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(failed(
+                    "filebrowser-error-create-directory",
+                    name,
+                    &io_reason(&e),
+                ));
+                false
+            }
+        }
     }
 
     fn create_file(&mut self, name: &str) -> bool {
@@ -343,7 +379,18 @@ impl Plugin for FilebrowserProvider {
             return false;
         }
         let full = self.dir().join(name);
-        std::fs::File::create(&full).is_ok()
+        // Never over a file of that name: `File::create` would empty it.
+        match std::fs::File::create_new(&full) {
+            Ok(_) => true,
+            Err(e) => {
+                self.error = Some(failed(
+                    "filebrowser-error-create-file",
+                    name,
+                    &io_reason(&e),
+                ));
+                false
+            }
+        }
     }
 
     fn copy_item(
@@ -357,11 +404,15 @@ impl Plugin for FilebrowserProvider {
             .desktop
             .resolve(Path::new(src_dir))
             .join(src_name.trim_end_matches('/').trim_end_matches('\\'));
-        let dst = self
-            .desktop
-            .resolve(Path::new(dest_dir))
-            .join(dest_name.trim_end_matches('/').trim_end_matches('\\'));
-        copy_recursive(&src, &dst)
+        let dest_name = dest_name.trim_end_matches('/').trim_end_matches('\\');
+        let dst = self.desktop.resolve(Path::new(dest_dir)).join(dest_name);
+        match copy_recursive(&src, &dst) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(failed("filebrowser-error-copy", dest_name, &io_reason(&e)));
+                false
+            }
+        }
     }
 
     fn commands(&self) -> Vec<String> {
@@ -382,6 +433,11 @@ impl Plugin for FilebrowserProvider {
         element_key: &str,
         element_type: i32,
     ) -> Result<Option<FfonElement>, String> {
+        if matches!(command, "create directory" | "create file")
+            && let Some(why) = self.cannot_add_here()
+        {
+            return Err(why);
+        }
         Ok(match command {
             "create directory" => Some(new_obj_with_i_placeholder("<input></input>")),
             "create file" => Some(FfonElement::Str("<input></input>".into())),
@@ -559,6 +615,66 @@ fn entry_name(label: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Error messages
+// ---------------------------------------------------------------------------
+
+/// `key` filled in with the item's `name` and the reason it failed.
+fn failed(key: &str, name: &str, why: &str) -> String {
+    let mut args = localize::Args::new();
+    args.set("name", name);
+    args.set("err", why);
+    localize::t_args(key, &args)
+}
+
+/// Why the system refused, short enough to read out: the user's language for
+/// a missing right (a folder that needs sudo), else the system's own words
+/// without their `(os error N)`.
+fn io_reason(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return localize::t("filebrowser-error-reason-permission-denied");
+    }
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
+}
+
+/// Whether the user may create entries in `dir`: write and search rights,
+/// judged by the system as it will judge the create itself.
+#[cfg(unix)]
+fn may_create_in(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: a valid C string, which `access` only reads.
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere the create itself is the only judge: it says why on Enter.
+#[cfg(not(unix))]
+fn may_create_in(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// [`io_reason`] for an error that crossed the app as text (the trash): its
+/// `(os error N)`, when it has one, says which error it was.
+fn reason(text: &str) -> String {
+    let code = text
+        .strip_suffix(')')
+        .and_then(|t| t.rsplit_once("(os error "))
+        .and_then(|(_, n)| n.parse::<i32>().ok());
+    match code {
+        Some(n) => io_reason(&std::io::Error::from_raw_os_error(n)),
+        None => text.to_owned(),
+    }
+}
+
 /// The names in `dir`, skipping any entry that cannot be read.
 fn list_dir(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(std::fs::read_dir(dir)?
@@ -723,24 +839,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 // Copy
 // ---------------------------------------------------------------------------
 
-fn copy_recursive(src: &Path, dst: &Path) -> bool {
+/// Copy `src` to `dst`, a folder with everything in it. Stops at the first
+/// failure, whose error is the one the user is told.
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
-        if std::fs::create_dir_all(dst).is_err() {
-            return false;
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)?.flatten() {
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
         }
-        let rd = match std::fs::read_dir(src) {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        for entry in rd.flatten() {
-            let child_dst = dst.join(entry.file_name());
-            if !copy_recursive(&entry.path(), &child_dst) {
-                return false;
-            }
-        }
-        true
+        Ok(())
     } else {
-        std::fs::copy(src, dst).is_ok()
+        std::fs::copy(src, dst).map(|_| ())
     }
 }
 
@@ -883,6 +992,8 @@ mod tests {
             "a delete the trash refused is not done"
         );
         assert!(file.exists());
+        let err = p.take_error().expect("a refused delete says why");
+        assert!(err.starts_with("could not delete x.txt: "), "{err}");
     }
 
     /// The fake must really take the item away, or every `!path.exists()`
@@ -1000,6 +1111,20 @@ mod tests {
         assert!(dir.path().join("new_dir").is_dir());
     }
 
+    /// Creating a name that is taken leaves what is there alone.
+    #[test]
+    fn creating_an_existing_file_keeps_its_contents() {
+        let (mut p, dir) = make_provider();
+        std::fs::write(dir.path().join("kept.txt"), b"precious").unwrap();
+        assert!(!p.create_file("kept.txt"));
+        assert_eq!(
+            std::fs::read(dir.path().join("kept.txt")).unwrap(),
+            b"precious"
+        );
+        let err = p.take_error().unwrap();
+        assert!(err.starts_with("could not create kept.txt: "), "{err}");
+    }
+
     #[test]
     fn test_create_file_empty_name_fails() {
         let (mut p, _dir) = make_provider();
@@ -1047,6 +1172,172 @@ mod tests {
         std::fs::write(sub.join("file.txt"), b"x").unwrap();
         assert!(p.delete_item("<input>sub</input>"));
         assert!(!sub.exists());
+    }
+
+    // ---- a folder the user cannot write to ---------------------------------
+
+    /// A folder the test user cannot write to, as `/etc` is for a user
+    /// without sudo, holding `kept.txt`. `None` when the user can write there
+    /// anyway (root), where the test has nothing to show.
+    #[cfg(unix)]
+    struct ReadOnlyDir {
+        dir: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ReadOnlyDir {
+        fn new() -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join("kept.txt"), b"x").unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let ro = ReadOnlyDir { dir };
+            if std::fs::write(ro.path().join("probe"), b"").is_ok() {
+                return None;
+            }
+            Some(ro)
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.path(), std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn fb_in(dir: &ReadOnlyDir) -> FilebrowserProvider {
+        let mut p = fb();
+        p.set_current_path(dir.path().to_str().unwrap());
+        p
+    }
+
+    /// Where nothing can be created, the plugin says so before a name is
+    /// typed, and the create commands are refused with the same words.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_folder_says_nothing_can_be_added() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let mut p = fb_in(&dir);
+        let why = format!("cannot add to {}: permission denied", dir.path().display());
+        assert_eq!(p.cannot_add_here().as_deref(), Some(why.as_str()));
+        for cmd in ["create file", "create directory"] {
+            assert_eq!(p.handle_command(cmd, "", 0), Err(why.clone()), "{cmd}");
+        }
+        let (mut writable, _d) = make_provider();
+        assert_eq!(writable.cannot_add_here(), None);
+        assert!(writable.handle_command("create file", "", 0).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_system_refuses_to_create_says_why() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let mut p = fb_in(&dir);
+        assert!(!p.create_file("new.txt"));
+        assert!(!dir.path().join("new.txt").exists());
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not create new.txt: permission denied")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_system_refuses_to_create_says_why() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let mut p = fb_in(&dir);
+        assert!(!p.create_directory("new"));
+        assert!(!dir.path().join("new").exists());
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not create folder new: permission denied")
+        );
+    }
+
+    /// The trash's refusal crosses the app as text, its `(os error N)` intact,
+    /// and is told the same way as the others.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_the_system_refuses_says_why() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let mut p = fb_in(&dir);
+        assert!(!p.delete_item("<input>kept.txt</input>"));
+        assert!(dir.path().join("kept.txt").exists());
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not delete kept.txt: permission denied")
+        );
+        assert!(
+            p.take_timeline_entries().is_empty(),
+            "nothing to undo for a delete that did not happen"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rename_the_system_refuses_says_why() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let mut p = fb_in(&dir);
+        assert!(!p.commit_edit("<input>kept.txt</input>", "<input>moved.txt</input>"));
+        assert!(dir.path().join("kept.txt").exists());
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not rename kept.txt to moved.txt: permission denied")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_paste_the_system_refuses_says_why() {
+        let Some(dir) = ReadOnlyDir::new() else {
+            return;
+        };
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"x").unwrap();
+        let mut p = fb_in(&dir);
+        let (from, to) = (src.path().to_str().unwrap(), dir.path().to_str().unwrap());
+        assert!(!p.copy_item(from, "a.txt", to, "a.txt"));
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(
+            p.take_error().as_deref(),
+            Some("could not paste a.txt: permission denied")
+        );
+    }
+
+    /// Any other refusal is told in the system's words, without its
+    /// `(os error N)`; text that names no OS error is passed on as it is.
+    #[test]
+    fn a_reason_drops_the_os_error_number() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!io_reason(&missing).contains("os error"));
+        #[cfg(unix)]
+        {
+            let enoent = std::io::Error::from_raw_os_error(2);
+            assert_eq!(io_reason(&enoent), "No such file or directory");
+            assert_eq!(reason(&enoent.to_string()), "No such file or directory");
+            assert_eq!(
+                reason("Permission denied (os error 13)"),
+                "permission denied"
+            );
+        }
+        assert_eq!(reason("the trash is full"), "the trash is full");
     }
 
     // ---- copy_item ---------------------------------------------------------
