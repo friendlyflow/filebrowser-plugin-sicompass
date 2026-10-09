@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- When creating, deleting, renaming or pasting fails, it says why.
+- In a folder you cannot write to, adding is refused before you type a name.
+- Creating a file never empties a file that already exists.
+
 ## 0.3.0
 
 File Browser is a program of its own now, instead of a sandboxed WebAssembly component.
