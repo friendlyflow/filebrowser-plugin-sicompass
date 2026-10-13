@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- On Windows, a path you open or delete keeps its drive letter, so it stays absolute.
+
 ## 0.3.1
 
 - When creating, deleting, renaming or pasting fails, it says why.

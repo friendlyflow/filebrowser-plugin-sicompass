@@ -146,7 +146,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "filebrowser-plugin"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "libc",
@@ -642,9 +642,9 @@ dependencies = [
 
 [[package]]
 name = "sicompass-sdk"
-version = "0.9.5"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84eae40d208858be4504303f3b3b3d4f5c8e673345d61548d0bca8440ea57173"
+checksum = "6b2b9c4c4ad66f10ee7291b9b4a22126f3a139ebcb7bb7542a404d610e68c285"
 dependencies = [
  "async-trait",
  "libc",
