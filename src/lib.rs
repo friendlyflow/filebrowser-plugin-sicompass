@@ -1939,6 +1939,43 @@ mod tests {
         assert!(names.contains(&"link.txt".to_string()));
     }
 
+    /// Every path handed to the app has to be absolute: `real_path` in
+    /// sicompass's plugin host refuses anything else outright, and a delete is
+    /// the app's to carry out.
+    ///
+    /// It is a test of its own because the way it broke was invisible here:
+    /// `dir()` resolves the folder through `sicompass_sdk::fs_links`, which on
+    /// Windows threw the drive away (`C:\dir\new.txt` came back as
+    /// `\dir\new.txt`). Creating still worked, because the OS fills in the
+    /// drive the process happens to be on, so the first sign of it was a file
+    /// the user had just made and could not delete.
+    #[test]
+    fn a_delete_names_an_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(tmp.path().is_absolute(), "the fixture itself is absolute");
+
+        let desktop = FakeDesktop::default();
+        let mut p = fb_on(&desktop);
+        p.set_current_path(tmp.path().to_str().unwrap());
+
+        // Made through the provider, the way the user makes one.
+        assert!(p.commit_edit("", "new.txt"), "{:?}", p.take_error());
+        assert!(tmp.path().join("new.txt").exists(), "created on disk");
+        assert!(
+            p.delete_item("<input>new.txt</input>"),
+            "{:?}",
+            p.take_error()
+        );
+
+        let trashed = desktop.0.borrow().items[0].0.clone();
+        assert!(
+            trashed.is_absolute(),
+            "the app would refuse `{}` as not absolute",
+            trashed.display()
+        );
+        assert_eq!(trashed, tmp.path().join("new.txt"));
+    }
+
     // -- Undoable delete: a ProviderOp carrying the snapshot ----------------
 
     fn snapshot_of(entry: &ProviderOp) -> FsSideEffect {
@@ -2184,12 +2221,17 @@ mod tests {
             ("Text Editor", "gedit")
         );
         assert!(p.execute_command("open file with", "gedit"));
+        // `canonicalize` for the symlinks along the way, which is the point on
+        // macOS (`/tmp` is `/private/tmp`). On Windows it also returns the
+        // verbatim form (`\\?\C:\…`), which `fs_links::resolve` never produces
+        // and the shell APIs behind `open_with` do not take, so that prefix is
+        // the one difference to undo.
+        let expected = dir.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let expected = PathBuf::from(expected.to_string_lossy().trim_start_matches(r"\\?\"));
         assert_eq!(
             desktop.0.borrow().opened,
-            vec![(
-                "gedit".to_owned(),
-                dir.path().canonicalize().unwrap().join("test.txt")
-            )]
+            vec![("gedit".to_owned(), expected.join("test.txt"))]
         );
     }
 
