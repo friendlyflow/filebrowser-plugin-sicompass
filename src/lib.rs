@@ -7,6 +7,9 @@
 //! - Root is `/`.
 //! - Each directory entry is wrapped in `<input>name</input>` so the user can
 //!   rename it inline. Directories are `Obj`, files are `Str`.
+//! - `plugin.json` declares `markup`, so a name reaches a row through
+//!   `tags::escape`: a file called `<b>x.txt` stays a file name. What comes
+//!   back goes through [`unescape`], so a rename finds the real file.
 //! - Commands: create directory, create file, show/hide properties, show/hide
 //!   hidden files, sort alphanumerically or chronologically.
 //! - `commit_edit(old, new)` renames, `delete_item` moves to the OS trash
@@ -115,6 +118,18 @@ impl FilebrowserProvider {
         }
     }
 
+    /// The entry of the folder on screen that `label` means. A row comes back
+    /// as it was written, escaped, but the app's cut and undo send a name through
+    /// `strip_display` first, and a name such as `<input>y` then reads like a row.
+    /// So a name that is there is taken at its word.
+    fn entry_on_disk(&self, label: &str) -> String {
+        let literal = trim_separators(label);
+        if !literal.is_empty() && std::fs::symlink_metadata(self.dir().join(literal)).is_ok() {
+            return literal.to_owned();
+        }
+        trim_separators(&entry_name(label)).to_owned()
+    }
+
     fn list_directory(&self) -> Vec<FfonElement> {
         #[cfg(windows)]
         {
@@ -140,8 +155,9 @@ impl FilebrowserProvider {
 
         let mut out = Vec::with_capacity(raw.len());
         for entry in &raw {
+            // An owner or group name is as outside as a file name.
             let prop = if self.show_properties {
-                format_properties(entry)
+                tags::escape(&format_properties(entry))
             } else {
                 String::new()
             };
@@ -150,7 +166,7 @@ impl FilebrowserProvider {
                 prop,
                 // no extra prefix beyond property string
                 "",
-                entry.name,
+                tags::escape(&entry.name),
             );
             let elem = if entry.is_dir {
                 FfonElement::new_obj(&label)
@@ -211,8 +227,14 @@ impl Plugin for FilebrowserProvider {
                 return;
             }
         }
-        self.current_path
-            .push(segment.trim_end_matches('/').trim_end_matches('\\'));
+        // Right sends the inside of the row's `<input>`, escaped, and the app's own
+        // walks send a real name. A name that is there is taken at its word.
+        let segment = trim_separators(segment);
+        if std::fs::symlink_metadata(self.dir().join(segment)).is_ok() {
+            self.current_path.push(segment);
+        } else {
+            self.current_path.push(unescape(segment));
+        }
     }
 
     fn pop_path(&mut self) {
@@ -250,8 +272,8 @@ impl Plugin for FilebrowserProvider {
     }
 
     fn commit_edit(&mut self, old: &str, new_content: &str) -> bool {
-        let old_name = tags::strip_display(old);
-        let new_name = tags::strip_display(new_content);
+        let old_name = entry_name(old);
+        let new_name = new_value(old, new_content);
 
         if old_name.is_empty() {
             // Committing an `i` placeholder — treat as a create.
@@ -274,8 +296,8 @@ impl Plugin for FilebrowserProvider {
         // The folder through any symlinks, the entries themselves as they are:
         // renaming a link renames the link.
         let dir = self.dir();
-        let old_name = old_name.trim_end_matches('/').trim_end_matches('\\');
-        let new_name = new_name.trim_end_matches('/').trim_end_matches('\\');
+        let old_name = trim_separators(&old_name);
+        let new_name = trim_separators(&new_name);
         match std::fs::rename(dir.join(old_name), dir.join(new_name)) {
             Ok(()) => true,
             Err(e) => {
@@ -290,11 +312,7 @@ impl Plugin for FilebrowserProvider {
     }
 
     fn delete_item(&mut self, name: &str) -> bool {
-        let name_clean = entry_name(name);
-        let name_clean = name_clean
-            .trim_end_matches('/')
-            .trim_end_matches('\\')
-            .to_owned();
+        let name_clean = self.entry_on_disk(name);
         let full = self.dir().join(&name_clean);
 
         // Snapshot the target before deletion so an undo can restore even if
@@ -403,8 +421,8 @@ impl Plugin for FilebrowserProvider {
         let src = self
             .desktop
             .resolve(Path::new(src_dir))
-            .join(src_name.trim_end_matches('/').trim_end_matches('\\'));
-        let dest_name = dest_name.trim_end_matches('/').trim_end_matches('\\');
+            .join(trim_separators(src_name));
+        let dest_name = trim_separators(dest_name);
         let dst = self.desktop.resolve(Path::new(dest_dir)).join(dest_name);
         match copy_recursive(&src, &dst) {
             Ok(()) => true,
@@ -462,7 +480,7 @@ impl Plugin for FilebrowserProvider {
                 if element_type == 1 {
                     return Err(localize::t("filebrowser-error-open-with-not-file"));
                 }
-                let filename = entry_name(element_key);
+                let filename = self.entry_on_disk(element_key);
                 if filename.is_empty() {
                     return Err(localize::t("filebrowser-error-open-with-no-filename"));
                 }
@@ -606,13 +624,49 @@ struct RawEntry {
 /// on, a permissions/owner/size prefix sits *outside* the `<input>` tag, and
 /// `strip_display` would keep it (yielding `drwxr-xr-x … name`). The `<input>`
 /// content is the true filename, so prefer it whenever the tag is present and
-/// fall back to `strip_display` for labels without one.
+/// fall back to `strip_display` for labels without one, such as the inside of
+/// the `<input>` that `commit_edit` gets as `old`.
+///
+/// `extract_input` rather than `has_input` first: `has_input` does not see a
+/// closing tag right after a backslash, so a name ending in one would fall back.
 fn entry_name(label: &str) -> String {
-    if tags::has_input(label) {
-        tags::extract_input(label).unwrap_or_else(|| tags::strip_display(label))
-    } else {
-        tags::strip_display(label)
+    match tags::extract_input(label) {
+        Some(inner) => unescape(&inner),
+        None => tags::strip_display(label),
     }
+}
+
+/// The new name in a `commit_edit`. The app sends what was typed as it was typed,
+/// so it is not read for tags: `a\<b` is a name with a backslash in it. Only an
+/// undo or redo replays whole rows, as both `old` and `new`, escaped as rows are.
+fn new_value(old: &str, new: &str) -> String {
+    match (tags::extract_input(old), tags::extract_input(new)) {
+        (Some(_), Some(inner)) => unescape(&inner),
+        _ => new.to_owned(),
+    }
+}
+
+/// Undo `tags::escape`. Safe on text that was never escaped.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some('<' | '>')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `name` without its trailing separators. A backslash is a separator on Windows
+/// only: anywhere else it is part of the name, and trimming it would name another
+/// file.
+fn trim_separators(name: &str) -> &str {
+    let name = name.trim_end_matches('/');
+    #[cfg(windows)]
+    let name = name.trim_end_matches('\\');
+    name
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,6 +2297,246 @@ mod tests {
             !p.execute_command("open file with", "firefox"),
             "execute_command should return false when no path is set"
         );
+    }
+
+    // --- markup: `plugin.json` asks for it, so every name is this plugin's to escape ---
+
+    /// Names a filesystem can hold that would read as tags. A name cannot hold a
+    /// `/`, so `<input>y</input>` itself cannot be one: see
+    /// `a_typed_name_with_a_whole_tag_in_it_is_refused_as_a_path`.
+    const ODD_NAMES: [&str; 6] = [
+        "<b>x.txt",
+        "<style>li { color: red }",
+        "<input>y",
+        "<src=3>z",
+        r"a\<b",
+        r"ends in a backslash\",
+    ];
+
+    fn key(e: &FfonElement) -> &str {
+        match e {
+            FfonElement::Str(s) => s,
+            FfonElement::Obj(o) => &o.key,
+        }
+    }
+
+    /// The row showing `name`, as the plugin wrote it.
+    fn row_of(p: &mut FilebrowserProvider, name: &str) -> String {
+        let items = p.fetch();
+        let row = items
+            .iter()
+            .map(key)
+            .find(|k| tags::strip_display(k) == name);
+        row.unwrap_or_else(|| panic!("no row shows {name:?}"))
+            .to_owned()
+    }
+
+    /// What the app sends as `old`: the inside of the row's `<input>`.
+    fn old_of(row: &str) -> String {
+        tags::extract_input(row).expect("every row has an input")
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn a_name_that_looks_like_a_tag_is_shown_as_it_is() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+            let row = row_of(&mut p, name);
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+            assert_eq!(sicompass_sdk::markup::plain(&row), row, "nothing to lower");
+            assert_eq!(sicompass_sdk::markup::style_sheet(&row), None, "{row}");
+            assert_eq!(entry_name(&row), name);
+        }
+    }
+
+    #[test]
+    fn a_folder_row_that_looks_like_a_tag_is_shown_as_it_is() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            let row = row_of(&mut p, name);
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        }
+    }
+
+    #[test]
+    fn the_properties_prefix_does_not_get_in_the_way_of_a_name() {
+        let (mut p, dir) = make_provider();
+        std::fs::write(dir.path().join("<b>x.txt"), b"x").unwrap();
+        p.handle_command("show/hide properties", "", 0).unwrap();
+        let items = p.fetch();
+        let row = key(&items[0]).to_owned();
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        assert_eq!(entry_name(&row), "<b>x.txt");
+        assert!(p.delete_item(&row));
+        assert!(!dir.path().join("<b>x.txt").exists());
+    }
+
+    #[test]
+    fn a_rename_finds_the_real_file_and_gives_it_the_typed_name() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            std::fs::write(dir.path().join(name), b"kept").unwrap();
+
+            let row = row_of(&mut p, name);
+            assert!(p.commit_edit(&old_of(&row), "plain.txt"), "from {name:?}");
+            assert!(!dir.path().join(name).exists(), "{name:?}");
+            assert_eq!(
+                std::fs::read(dir.path().join("plain.txt")).unwrap(),
+                b"kept"
+            );
+
+            // And back, typed: the name on disk is what was typed, no backslash added.
+            let row = row_of(&mut p, "plain.txt");
+            assert!(p.commit_edit(&old_of(&row), name), "to {name:?}");
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"kept");
+            row_of(&mut p, name);
+        }
+    }
+
+    /// An undo replays the two rows whole, both escaped.
+    #[test]
+    fn an_undo_of_a_rename_reads_both_rows() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            std::fs::write(dir.path().join(name), b"kept").unwrap();
+            let before = row_of(&mut p, name);
+            assert!(p.commit_edit(&old_of(&before), "after.txt"));
+            let after = row_of(&mut p, "after.txt");
+            assert!(p.commit_edit(&after, &before), "undo to {name:?}");
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"kept");
+            assert!(p.commit_edit(&before, &after), "redo from {name:?}");
+            assert_eq!(
+                std::fs::read(dir.path().join("after.txt")).unwrap(),
+                b"kept"
+            );
+        }
+    }
+
+    /// Before, `strip_display` read `new`: `<input>y</input>` named a file `y`.
+    #[test]
+    fn a_typed_name_with_a_whole_tag_in_it_is_refused_as_a_path() {
+        let (mut p, dir) = make_provider();
+        std::fs::write(dir.path().join("kept.txt"), b"x").unwrap();
+        assert!(!p.commit_edit("kept.txt", "<input>y</input>"));
+        assert!(p.take_error().is_some(), "the system's refusal is told");
+        assert!(dir.path().join("kept.txt").exists());
+        assert!(!dir.path().join("y").exists());
+    }
+
+    #[test]
+    fn a_new_file_or_folder_takes_the_typed_name_as_it_is() {
+        let (mut p, dir) = make_provider();
+        assert!(p.commit_edit("", "<input>y"));
+        assert!(dir.path().join("<input>y").is_file());
+        assert!(p.commit_edit("", r"a\<b"));
+        assert!(dir.path().join(r"a\<b").is_file());
+        assert!(p.commit_edit("", "<b>dir:"));
+        assert!(dir.path().join("<b>dir").is_dir());
+    }
+
+    #[test]
+    fn a_delete_finds_the_real_file_from_its_row_and_from_its_name() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            // The row, as the structural delete sends it.
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+            let row = row_of(&mut p, name);
+            assert!(p.delete_item(&row), "row of {name:?}");
+            assert!(!dir.path().join(name).exists(), "row of {name:?}");
+            // The bare name, as cut sends it after `strip_display`.
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+            assert!(p.delete_item(name), "name {name:?}");
+            assert!(!dir.path().join(name).exists(), "name {name:?}");
+        }
+    }
+
+    /// Cut sends `<input>y` bare. Read as a row that is `y`, another file.
+    #[test]
+    fn a_bare_name_that_reads_like_a_row_does_not_delete_another_file() {
+        let (mut p, dir) = make_provider();
+        std::fs::write(dir.path().join("<input>y"), b"x").unwrap();
+        std::fs::write(dir.path().join("y"), b"x").unwrap();
+        assert!(p.delete_item("<input>y"));
+        assert!(!dir.path().join("<input>y").exists());
+        assert!(dir.path().join("y").exists());
+    }
+
+    #[test]
+    fn opening_a_row_enters_the_real_folder() {
+        for name in ODD_NAMES {
+            let (mut p, dir) = make_provider();
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("inside.txt"), b"x").unwrap();
+            let row = row_of(&mut p, name);
+            // Right sends the inside of the `<input>` (`nav_segment`), anything else
+            // the text of the row. Either is the same folder.
+            for segment in [old_of(&row), tags::strip_display(&row)] {
+                p.push_path(&segment);
+                assert_eq!(
+                    p.current_path(),
+                    dir.path().join(name).to_str().unwrap(),
+                    "{segment:?}"
+                );
+                assert_eq!(
+                    tags::strip_display(key(&p.fetch()[0])),
+                    "inside.txt",
+                    "{segment:?}"
+                );
+                p.pop_path();
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_takes_the_bare_names_it_is_given() {
+        for name in ODD_NAMES {
+            let (mut p, src) = make_provider();
+            let dest = TempDir::new().unwrap();
+            std::fs::write(src.path().join(name), b"kept").unwrap();
+            assert!(p.copy_item(
+                src.path().to_str().unwrap(),
+                name,
+                dest.path().to_str().unwrap(),
+                name
+            ));
+            assert_eq!(std::fs::read(dest.path().join(name)).unwrap(), b"kept");
+        }
+    }
+
+    #[test]
+    fn open_with_finds_the_real_file() {
+        let (mut p, dir) = make_provider();
+        std::fs::write(dir.path().join("<b>x.txt"), b"x").unwrap();
+        let row = row_of(&mut p, "<b>x.txt");
+        p.handle_command("open file with", &row, 0).unwrap();
+        assert_eq!(p.open_with_path, Some(dir.path().join("<b>x.txt")));
+    }
+
+    #[test]
+    fn unescape_undoes_escape_and_leaves_other_text_alone() {
+        for text in ODD_NAMES {
+            assert_eq!(unescape(&tags::escape(text)), text);
+        }
+        assert_eq!(unescape(r"C:\notes"), r"C:\notes");
+        assert_eq!(unescape("plain"), "plain");
+    }
+
+    /// `tags::has_input` does not see the `</input>` right after a backslash, so
+    /// the app offers no edit on a name that ends in one. The plugin's half works
+    /// (`a_rename_finds_the_real_file_and_gives_it_the_typed_name`), the row is
+    /// shown right, and Right and delete find the file: only `i` does nothing.
+    #[test]
+    fn a_name_ending_in_a_backslash_can_be_edited_in_the_app() {
+        let (mut p, dir) = make_provider();
+        let name = r"ends in a backslash\";
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+        assert!(tags::has_input(&row_of(&mut p, name)));
     }
 }
 
