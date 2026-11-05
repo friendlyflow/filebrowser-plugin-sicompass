@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+- File names and owners are shown exactly as they are, and a rename, open or delete reads back the real name. A backslash is only a separator on Windows.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.2
 
 - On Windows, a path you open or delete keeps its drive letter, so it stays absolute.
