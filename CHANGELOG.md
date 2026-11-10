@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- Ctrl+F searches the whole folder tree on a thread of its own, names only, breadth first, up to 100 000 results or 30 seconds, and says when that stopped it. It skips hidden entries unless shown, and goes into no symlink, other filesystem, `node_modules` or cache folder.
+- Needs sicompass 0.2.6.
+
 ## 0.3.3
 
 - File names and owners are shown exactly as they are, and a rename, open or delete reads back the real name. A backslash is only a separator on Windows.
