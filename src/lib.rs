@@ -14,7 +14,10 @@
 //!   hidden files, sort alphanumerically or chronologically.
 //! - `commit_edit(old, new)` renames, `delete_item` moves to the OS trash
 //!   through the app (`desktop::trash`), `copy_item` copies recursively.
-//! - Extended search is a BFS walk (up to 50 000 results, or 5 seconds).
+//! - Extended search (Ctrl+F) is a breadth-first walk of names on a thread of
+//!   its own, up to 100 000 results or 30 seconds. It skips hidden entries
+//!   unless they are shown, does not go into `node_modules`, a cache folder
+//!   (`CACHEDIR.TAG`), a symlink or another filesystem, and writes nothing.
 //!
 //! A delete is undoable: the item is snapshotted first
 //! (`sicompass_sdk::fs_snapshot`) and the snapshot rides in the `ProviderOp`
@@ -36,7 +39,7 @@ use sicompass_sdk::ffon::FfonElement;
 use sicompass_sdk::fs_snapshot;
 use sicompass_sdk::placeholders::new_obj_with_i_placeholder;
 use sicompass_sdk::plugin::{
-    Descriptor, ListItem, Plugin, PollResult, ProviderOp, SearchResult, host,
+    Descriptor, ExtendedSearch, ListItem, Plugin, PollResult, ProviderOp, SearchResult, host,
 };
 use sicompass_sdk::tags;
 use sicompass_sdk::timeline::FsSideEffect;
@@ -514,8 +517,24 @@ impl Plugin for FilebrowserProvider {
         }
     }
 
+    /// The walk below, all at once, for an app from before protocol 1.3. The
+    /// app waits for it, drawing nothing meanwhile, hence the short budget.
     fn collect_extended_search_items(&self) -> Option<Vec<SearchResult>> {
-        Some(self.run_extended_search())
+        let mut results = Vec::new();
+        if let Some(walk) = self.search_walk() {
+            let _all = walk.run(Duration::from_secs(5), 50_000, &mut |item| {
+                results.push(item);
+                true
+            });
+        }
+        Some(results)
+    }
+
+    fn extended_search(&self) -> Option<ExtendedSearch> {
+        let walk = self.search_walk()?;
+        Some(Box::new(move |found| {
+            walk.run(SEARCH_BUDGET, SEARCH_MAX_ITEMS, found)
+        }))
     }
 }
 
@@ -537,71 +556,142 @@ fn decode_side_effect(entry: &ProviderOp) -> Option<FsSideEffect> {
 }
 
 impl FilebrowserProvider {
-    fn run_extended_search(&self) -> Vec<SearchResult> {
-        const MAX_ITEMS: usize = 50_000;
-        // The app waits for this call, drawing nothing meanwhile. A walk of a
-        // slow disk or a network mount stops here with what it found.
-        const BUDGET: Duration = Duration::from_secs(5);
-        let deadline = Instant::now() + BUDGET;
-        let mut results = Vec::new();
-        let root = self.dir();
-
-        // BFS queue: (dir_path, breadcrumb)
-        let mut queue: std::collections::VecDeque<(PathBuf, String)> =
-            std::collections::VecDeque::new();
-        queue.push_back((root, String::new()));
-
-        while let Some((dir, breadcrumb)) = queue.pop_front() {
-            if results.len() >= MAX_ITEMS || Instant::now() >= deadline {
-                break;
+    /// The walk below the folder on screen, or `None` where there is no folder
+    /// (the list of drives on Windows).
+    fn search_walk(&self) -> Option<SearchWalk> {
+        #[cfg(windows)]
+        {
+            if self.current_path == Path::new("/") {
+                return None;
             }
+        }
+        Some(SearchWalk {
+            root: self.dir(),
+            nav_root: self.current_path.clone(),
+            show_hidden: self.show_hidden,
+        })
+    }
+}
 
-            let Ok(names) = list_dir(&dir) else {
+// ---------------------------------------------------------------------------
+// Extended search (Ctrl+F)
+// ---------------------------------------------------------------------------
+
+/// How much Ctrl+F's walk hands over at most. It runs on a thread of its own
+/// ([`Plugin::extended_search`]), so the app goes on drawing meanwhile.
+const SEARCH_MAX_ITEMS: usize = 100_000;
+/// How long Ctrl+F's walk goes on at most.
+const SEARCH_BUDGET: Duration = Duration::from_secs(30);
+
+/// A folder whose contents are someone else's and only get in the way of a
+/// search: it is listed, but the walk does not go into it.
+const NOT_SEARCHED_INSIDE: &[&str] = &["node_modules"];
+/// A folder holding this file is a cache (<https://bford.info/cachedir/>:
+/// Rust's `target/`, and many tools' caches), and the walk leaves its contents
+/// out.
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// Everything below a folder, by name, breadth first, so the levels nearest
+/// the user come first.
+///
+/// It reads names only, never what a file holds, and writes nothing. It does
+/// not follow symlinks (a link to a folder is listed, not entered), does not
+/// leave the disk it started on (`/proc` and a network mount are other
+/// filesystems), and stops at its budget.
+struct SearchWalk {
+    /// The folder on disk, through any symlinks.
+    root: PathBuf,
+    /// The same folder as the app's path, which `nav_path` is built on, so
+    /// Enter walks to a result the way the user would.
+    nav_root: PathBuf,
+    show_hidden: bool,
+}
+
+impl SearchWalk {
+    /// Hand everything below to `found`, until it answers `false`. `false` when
+    /// the budget stopped the walk before it had seen everything.
+    fn run(
+        self,
+        budget: Duration,
+        max_items: usize,
+        found: &mut dyn FnMut(SearchResult) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + budget;
+        let root_device = device(&self.root);
+        let mut handed = 0usize;
+        // (folder on disk, the same folder as the app's path, breadcrumb)
+        let mut queue = std::collections::VecDeque::from([(
+            self.root.clone(),
+            self.nav_root.clone(),
+            String::new(),
+        )]);
+
+        while let Some((dir, nav_dir, breadcrumb)) = queue.pop_front() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let Ok(read) = std::fs::read_dir(&dir) else {
                 continue;
             };
+            // The type comes with the listing on most systems, so a file costs
+            // no read of its own. It is the link's own type: a link is never
+            // followed.
+            let mut entries: Vec<(String, bool)> = read
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    (e.file_name().to_string_lossy().into_owned(), is_dir)
+                })
+                .collect();
+            if dir != self.root && entries.iter().any(|(name, _)| name == CACHEDIR_TAG) {
+                continue;
+            }
+            entries.sort_by(|a, b| natord::compare_ignore_case(&a.0, &b.0));
 
-            for name in names {
-                if results.len() >= MAX_ITEMS {
-                    break;
-                }
-                let entry_path = dir.join(&name);
-                // Agree with `list_directory`: an extended search that surfaced the
+            for (name, is_dir) in entries {
+                // Agree with `list_directory`: a search that surfaced the
                 // contents of `.git` while the listing hides it would be both
-                // confusing and, on a large repo, most of the item budget.
+                // confusing and, on a large repo, most of the budget.
                 if !self.show_hidden && name.starts_with('.') {
                     continue;
                 }
-                // Use symlink_metadata to avoid following symlinks (guards against loops)
-                let meta = match entry_path.clone().symlink_metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let is_dir = meta.is_dir();
-                let label = if is_dir {
-                    format!("+ {name}")
-                } else {
-                    format!("- {name}")
-                };
-                let nav_path = entry_path.clone().to_string_lossy().into_owned();
-                results.push(SearchResult {
-                    label,
+                if handed >= max_items {
+                    return false;
+                }
+                let path = dir.join(&name);
+                let nav_path = nav_dir.join(&name);
+                let item = SearchResult {
+                    label: format!("{} {name}", if is_dir { '+' } else { '-' }),
                     breadcrumb: breadcrumb.clone(),
-                    nav_path: nav_path.clone(),
-                });
-
-                if is_dir {
-                    let child_bc = if breadcrumb.is_empty() {
-                        format!("{name} > ")
-                    } else {
-                        format!("{breadcrumb}{name} > ")
-                    };
-                    queue.push_back((entry_path.clone(), child_bc));
+                    nav_path: nav_path.to_string_lossy().into_owned(),
+                };
+                // The user left the search: what is left was not wanted.
+                if !found(item) {
+                    return true;
+                }
+                handed += 1;
+                if is_dir
+                    && !NOT_SEARCHED_INSIDE.contains(&name.as_str())
+                    && device(&path) == root_device
+                {
+                    queue.push_back((path, nav_path, format!("{breadcrumb}{name} > ")));
                 }
             }
         }
-
-        results
+        true
     }
+}
+
+/// The filesystem `path` is on, where the platform says.
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device(_path: &Path) -> Option<u64> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,6 +1791,180 @@ mod tests {
         p.set_current_path(dir.path().to_str().unwrap());
         let results = p.collect_extended_search_items().unwrap_or_default();
         assert!(results.iter().any(|r| r.label.contains("deep.txt")));
+    }
+
+    /// Everything the threaded walk hands over, run here on the test's thread.
+    fn walked(p: &FilebrowserProvider) -> Vec<SearchResult> {
+        let walk = p.extended_search().expect("a folder has a walk");
+        let mut out = Vec::new();
+        let saw_everything = walk(&mut |item| {
+            out.push(item);
+            true
+        });
+        assert!(saw_everything, "a small folder is walked whole");
+        out
+    }
+
+    fn nav_paths(results: &[SearchResult]) -> Vec<String> {
+        results.iter().map(|r| r.nav_path.clone()).collect()
+    }
+
+    /// Nearest first: the whole of a level before anything below it, in the
+    /// listing's order, each with the path Enter walks and its breadcrumb.
+    #[test]
+    fn test_threaded_search_is_breadth_first_with_paths_and_breadcrumbs() {
+        let (p, dir) = make_provider();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("b/inner")).unwrap();
+        std::fs::write(root.join("b/inner/deep.txt"), b"").unwrap();
+        std::fs::write(root.join("a.txt"), b"").unwrap();
+        std::fs::write(root.join("c.txt"), b"").unwrap();
+
+        let results = walked(&p);
+        let rel: Vec<String> = nav_paths(&results)
+            .iter()
+            .map(|n| n.strip_prefix(root.to_str().unwrap()).unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            rel,
+            ["/a.txt", "/b", "/c.txt", "/b/inner", "/b/inner/deep.txt"]
+        );
+        let deep = results.last().unwrap();
+        assert_eq!(deep.label, "- deep.txt");
+        assert_eq!(deep.breadcrumb, "b > inner > ");
+        assert_eq!(results[1].label, "+ b");
+        assert_eq!(results[1].breadcrumb, "");
+    }
+
+    /// `node_modules` and a tagged cache (Rust's `target/`) are listed, so the
+    /// user can still find them, but what is inside is left out.
+    #[test]
+    fn test_threaded_search_does_not_go_into_dependencies_or_caches() {
+        let (p, dir) = make_provider();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("node_modules/left")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/CACHEDIR.TAG"), b"Signature: x").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"").unwrap();
+
+        let labels: Vec<String> = walked(&p).into_iter().map(|r| r.label).collect();
+        assert!(labels.contains(&"+ node_modules".to_owned()));
+        assert!(labels.contains(&"+ target".to_owned()));
+        assert!(labels.contains(&"- main.rs".to_owned()));
+        assert!(!labels.contains(&"+ left".to_owned()), "{labels:?}");
+        assert!(!labels.contains(&"+ debug".to_owned()), "{labels:?}");
+        assert!(!labels.contains(&"- CACHEDIR.TAG".to_owned()), "{labels:?}");
+    }
+
+    /// Searching from inside a cache folder still searches it: only a cache
+    /// met on the way down is skipped.
+    #[test]
+    fn test_threaded_search_from_inside_a_cache_searches_it() {
+        let (p, dir) = make_provider();
+        std::fs::write(dir.path().join("CACHEDIR.TAG"), b"Signature: x").unwrap();
+        std::fs::write(dir.path().join("build.log"), b"").unwrap();
+        let labels: Vec<String> = walked(&p).into_iter().map(|r| r.label).collect();
+        assert!(labels.contains(&"- build.log".to_owned()), "{labels:?}");
+    }
+
+    /// The walk returns as soon as the app no longer wants more.
+    #[test]
+    fn test_threaded_search_stops_when_told() {
+        let (p, dir) = make_provider();
+        for i in 0..20 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"").unwrap();
+        }
+        let walk = p.extended_search().unwrap();
+        let mut seen = 0;
+        let saw_everything = walk(&mut |_| {
+            seen += 1;
+            seen < 3
+        });
+        assert_eq!(seen, 3);
+        // Not the budget: the user left, and that is not news to them.
+        assert!(saw_everything);
+    }
+
+    /// A walk the budget stops says so, so the user is told the results are
+    /// incomplete.
+    #[test]
+    fn test_threaded_search_says_when_its_budget_stopped_it() {
+        let (p, dir) = make_provider();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"").unwrap();
+        }
+        let mut seen = 0;
+        let saw_everything = p
+            .search_walk()
+            .unwrap()
+            .run(Duration::from_secs(30), 3, &mut |_| {
+                seen += 1;
+                true
+            });
+        assert_eq!(seen, 3);
+        assert!(!saw_everything);
+        let saw_everything = p
+            .search_walk()
+            .unwrap()
+            .run(Duration::ZERO, 100, &mut |_| true);
+        assert!(!saw_everything, "out of time before the first folder");
+    }
+
+    /// The walk agrees with the listing about hidden entries.
+    #[test]
+    fn test_threaded_search_skips_hidden_unless_shown() {
+        let (mut p, dir) = make_provider();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), b"").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), b"").unwrap();
+        let labels: Vec<String> = walked(&p).into_iter().map(|r| r.label).collect();
+        assert_eq!(labels, ["- visible.txt"]);
+
+        p.handle_command("show/hide hidden files", "", 0).unwrap();
+        let labels: Vec<String> = walked(&p).into_iter().map(|r| r.label).collect();
+        assert!(labels.contains(&"+ .git".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"- config".to_owned()), "{labels:?}");
+    }
+
+    /// A link to a folder is listed but not followed: a link back up would
+    /// otherwise walk in circles, and the folder is found where it really is.
+    #[cfg(unix)]
+    #[test]
+    fn test_threaded_search_does_not_follow_symlinks() {
+        let (p, dir) = make_provider();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("only-once.txt"), b"").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), real.join("up")).unwrap();
+
+        let results = walked(&p);
+        let once = results
+            .iter()
+            .filter(|r| r.label == "- only-once.txt")
+            .count();
+        assert_eq!(once, 1);
+        assert!(results.iter().any(|r| r.label == "- link"));
+    }
+
+    /// The paths are the app's, not the disk's: from a folder reached through
+    /// a link, Enter walks the way the user came.
+    #[cfg(unix)]
+    #[test]
+    fn test_threaded_search_paths_follow_the_users_path() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("x.txt"), b"").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut p = fb();
+        p.set_current_path(link.to_str().unwrap());
+        assert_eq!(
+            nav_paths(&walked(&p)),
+            [link.join("x.txt").to_string_lossy().into_owned()]
+        );
     }
 
     #[test]
